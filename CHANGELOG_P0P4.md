@@ -189,10 +189,69 @@ temp\config.json.bak_p0p4_20261123_151251
 
 ---
 
+## 重启/配置编辑器子进程证书失效修复（2026-11-24）
+
+**现象**：打包 exe 里点「重启」或「配置」后，新实例的状态获取全部失败，日志报
+`Could not find a suitable TLS CA certificate bundle, invalid path: C:\...\Temp\_MEI000446dc2\certifi\cacert.pem`；
+父实例退出时还弹框 `Failed to remove temporary directory`。
+
+**根因**：PyInstaller 单文件 exe 的 bootloader 会读 `_PYI_APPLICATION_HOME_DIR` 与 `_PYI_PARENT_PROCESS_LEVEL`。
+`subprocess.Popen` 默认继承父进程环境变量，于是新实例认为自己是被拉起的下级进程，
+不再独立解包，直接复用父实例的 `_MEIxxxx` 目录。父实例随后退出并清理该目录，
+子进程手里的 `certifi/cacert.pem` 路径就失效了 —— TLS 校验失败、行情全部拿不到；
+同时因为子进程还占着目录，父进程删不掉，于是弹出 `Failed to remove temporary directory`。
+
+**改法**：新增 `_child_env()`，在启动子进程前剔除 `_PYI_APPLICATION_HOME_DIR`、
+`_PYI_PARENT_PROCESS_LEVEL`、`_PYI_ARCHIVE_FILE`、`_PYI_SPLASH_IPC`、`_MEIPASS2`，
+强制子进程解包到自己的 `_MEI` 目录。接入两处 `subprocess.Popen`：
+
+| 位置 | 场景 |
+| --- | --- |
+| `_open_config_ui()` | 主界面点「配置」拉起 config_ui |
+| 重启逻辑 | 「重启」拉起新实例 |
+
+**校验**：`py_compile` 通过；`_child_env()` 单元校验确认 PYI 变量全部剔除、`THS_T_DATA_DIR`/`PATH` 等业务变量保留、父进程环境不受影响；
+重新打包后 exe 连续启动两轮均正常抓取两只标的行情，退出后 `%TEMP%` 下无新增 `_MEI` 残留。
+另清理了历史遗留的 64 个 `_MEI` 目录（其中 13 个各 63.5 MB，合计回收约 843 MB）。
+
+**回滚**：`main.py.bak_childenv_20261124_121915`、`ths_t_trader.exe.bak_childenv_<时间戳>`
+
+---
+
 ## 待观察项
 
 1. 159866 一天仅 1 次反T + 冷却 1800 秒，若觉得过少，调 `position_overrides.159866.signals.sell_first.max_sell_per_day` 与 `trade.cooldown_sec`
 2. `target_pct` 与 `target_ticks` 取大者作为卖出门槛，改动其一注意保持同量级
 3. 过户费双向或仅卖出各券商口径不同，当前按仅卖出计，可按实际情况改 `transfer_fee_pct` 的收取方向
 4. 全部验证基于 dry_run=true 与历史 K 线回放，未做实盘撮合验证
+
+---
+
+## 配置编辑器：持仓 ⇄ 行情监控联动（2026-11-24）
+
+**问题**：持仓页填的标的不会出现在「行情监控」里，要先手工在行情页再录一次代码，两边不一致时监控列表还会漏掉实际持仓标的。
+
+**改法**（`config_ui.py`，ConfigUI / PositionsEditor 各自新增接口）：
+
+| 组件 | 新增方法 | 作用 |
+| --- | --- | --- |
+| ConfigUI | `_market_codes_row()` / `market_codes()` | 读取行情监控代码输入框 |
+| ConfigUI | `position_editor()` / `position_codes()` | 读取持仓页当前代码集合 |
+| ConfigUI | `sync_market_codes(added, removed)` | 增量并入/移出行情监控 |
+| ConfigUI | `_initial_market_sync()` | 打开即对齐：持仓有、行情无的代码自动补入 |
+| ConfigUI | `_merge_positions_into_market(data)` | 保存前兜底，只增不删 |
+| PositionsEditor | `_on_code_edit(widgets)` | 代码填满 6 位即时并入行情监控 |
+| PositionsEditor | `_sync_removed(code)` | 删除持仓行时，代码不再被任何持仓引用则移出行情 |
+
+**联动规则**
+1. 持仓页代码填满 6 位 → 立即并入行情监控列表；
+2. 删除持仓行 → 仅当该代码不再被其它持仓引用时才从行情移除（避免误删）；
+3. 保存时再兜底合并一次，只增不删，不会覆盖用户手工加的监控标的。
+
+**校验**：无头自检 9 项全 PASS；`--selftest` 仅剩历史遗留的未映射键提示；`--gui-smoke` 报告「与磁盘差异 1 处」为持仓 600036 自动补入行情的预期行为，判定 PASSED；重新打包后 exe 直接跑 `--ui --gui-smoke`、`--ui --check` 退出码均为 0。
+
+**同时修复**：配置编辑器窗口偏小时「保存 / 保存并退出」按钮被挤出可视区，改为固定在底部、快捷键保存与退出绑定（`_on_shortcut_save` / `_on_shortcut_exit`）。
+
+---
+
 *（内容由AI生成，仅供参考）*

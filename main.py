@@ -79,6 +79,25 @@ def _default_data_root() -> Path:
 DATA_ROOT = _default_data_root()
 
 
+def _child_env() -> Dict[str, str]:
+    """为「再拉起一个本程序实例」准备干净的环境变量。
+
+    PyInstaller onefile 的 bootloader 会读取 _PYI_APPLICATION_HOME_DIR 与
+    _PYI_PARENT_PROCESS_LEVEL：这两个变量一旦存在，新进程会认为自己是父进程
+    拉起的下级进程，直接复用父进程的 _MEIxxxx 解包目录而不再独立解包。
+    父进程随后退出并清理该目录，于是子进程出现 certifi/cacert.pem 丢失
+    （状态获取失败 / TLS CA bundle invalid path），父进程退出时也会报
+    "Failed to remove temporary directory"。
+
+    这里剔除相关变量，强制子进程解包到它自己的 _MEI 目录，两个症状一起消失。
+    """
+    env = os.environ.copy()
+    for key in ("_PYI_APPLICATION_HOME_DIR", "_PYI_PARENT_PROCESS_LEVEL",
+                "_PYI_ARCHIVE_FILE", "_PYI_SPLASH_IPC", "_MEIPASS2"):
+        env.pop(key, None)
+    return env
+
+
 def resolve_log_dir(cfg: Optional[Dict[str, Any]] = None) -> Path:
     """日志 / 审计 / 截图目录：留空默认 <DATA_ROOT>/logs，绝对路径原样使用，相对路径以 <DATA_ROOT> 为基准。"""
     raw = ""
@@ -3261,19 +3280,29 @@ class TraderApp:
                     mb.showerror("打开失败", str(exc))
             return
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        self._cfg_snapshot = self._config_snapshot()   # 记录打开前的磁盘状态，退出后比对
         try:
             ui_cmd = ([sys.executable, "--ui"] if frozen else [sys.executable, str(script)])
             self.cfg_ui_proc = subprocess.Popen(
                 ui_cmd + ["--config", str(self.config_path)],
-                cwd=str(BASE_DIR), close_fds=True, creationflags=flags)
+                cwd=str(BASE_DIR), close_fds=True, creationflags=flags,
+                env=_child_env())
         except Exception as exc:
             mb.showerror("启动配置编辑器失败", str(exc))
             return
         self.logger.info("打开配置编辑器 | pid=%s | 配置=%s", self.cfg_ui_proc.pid, self.config_path)
         self.root.after(1000, self._poll_config_ui)
 
+    def _config_snapshot(self) -> Optional[Tuple[int, int]]:
+        """取 config.json 的 (mtime_ns, size) 指纹，用于判断编辑器是否真的落盘。"""
+        try:
+            st = self.config_path.stat()
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
     def _poll_config_ui(self) -> None:
-        """盯住配置编辑器：正常退出（说明可能已保存）后询问是否重启生效。"""
+        """盯住配置编辑器：关闭后按文件指纹判断是否真的保存，再决定是否提示重启。"""
         import tkinter.messagebox as mb
         proc = self.cfg_ui_proc
         if proc is None or not self.running:
@@ -3282,9 +3311,20 @@ class TraderApp:
             self.root.after(1000, self._poll_config_ui)
             return
         self.cfg_ui_proc = None
+        before = getattr(self, "_cfg_snapshot", None)
+        after = self._config_snapshot()
+        saved = after is not None and after != before
         if proc.returncode != 0:
-            self.logger.info("配置编辑器非正常结束 | returncode=%s（可能未保存）", proc.returncode)
+            self.logger.info("配置编辑器非正常结束 | returncode=%s | 配置已变更=%s",
+                             proc.returncode, saved)
+        if not saved:
+            self.logger.info("配置未变更 | returncode=%s | 未触发重启", proc.returncode)
+            mb.showinfo("配置未变更",
+                        "config.json 没有发生变化，本次未保存任何修改，程序也不会重启。\n\n"
+                        "如需修改：重新打开配置编辑器 → 改完点【保存】按钮 → "
+                        "看到“保存成功”提示后再关闭窗口。")
             return
+        self.logger.info("配置已保存 | 询问是否重启 | 配置=%s", self.config_path)
         if mb.askyesno("配置已保存",
                        "config.json 已保存。\n\n是否立即重启监控进程让新参数生效？\n"
                        "（重启会取消当前未确认的信号弹窗；当日信号台账会先落盘、重启后自动恢复）"):
@@ -3362,7 +3402,7 @@ class TraderApp:
                      | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
         try:
             proc = subprocess.Popen(cmd, cwd=str(BASE_DIR), close_fds=True,
-                                    creationflags=flags,
+                                    creationflags=flags, env=_child_env(),
                                     stdout=fh, stderr=subprocess.STDOUT)
         except Exception as exc:
             self.running = True

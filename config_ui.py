@@ -290,7 +290,10 @@ SCHEMA: List[TabSpec] = [
             F("market.poll_interval_sec", "盘中轮询间隔", KIND_INT, "交易时段内两次抓取新浪行情的间隔秒数，3 秒足够分时级别判断。", "秒", lo=1, hi=600),
             F("market.offhours_poll_interval_sec", "非交易时段轮询间隔", KIND_INT, "非交易时段行情不变化，拉长间隔减少无谓请求。", "秒", lo=1, hi=3600),
             F("market.timeout_sec", "HTTP 超时", KIND_INT, "单次请求新浪接口的超时时间，超时只记 WARNING 并在下一轮重试。", "秒", lo=1, hi=120),
-            F("market.codes", "监控标的代码", KIND_CODELIST, "要监控的 6 位证券代码，多个用逗号分隔，例如 159325,159866。建议与持仓代码保持一致。"),
+            F("market.codes", "监控标的代码", KIND_CODELIST,
+              "要监控的 6 位证券代码，多个用逗号分隔，例如 159325,159866。"
+              "与「账户与标的」页持仓联动：持仓里的代码会自动并入这里，无需手动添加；删除持仓行也会同步移除。"
+              "只想监控、不持仓的代码，直接在此添加即可（不会被持仓表覆盖）。"),
             F("market.sina_url", "新浪行情接口地址", KIND_TEXT, "必须保留 {} 占位符，脚本会把逗号分隔的代码填进去。", ""),
             F("market.referer", "请求 Referer", KIND_TEXT, "新浪接口要求带 Referer，缺失会返回空数据。", ""),
         ],
@@ -652,7 +655,12 @@ class ConfigUI:
         self.root.minsize(960, 620)
         self._init_style()
         self._build()
-        self.status(f"已加载 {self.path}")
+        try:
+            self.root.protocol("WM_DELETE_WINDOW", self.on_exit)
+        except Exception:
+            pass
+        self.status(f"已加载 {self.path.name}（Ctrl+S 保存）")
+        self._initial_market_sync()
 
     # ---------------------------------------------------------------- 样式与骨架
     def _init_style(self) -> None:
@@ -687,13 +695,36 @@ class ConfigUI:
 
         footer = ttk.Frame(self.root, padding=(12, 8, 12, 10))
         footer.pack(fill="x")
+        # 状态栏限宽 + 按钮区独立成 column：避免长状态文本挤占空间导致按钮不可见
+        footer.columnconfigure(0, weight=1)
         self.status_var = tk.StringVar(value="")
-        ttk.Label(footer, textvariable=self.status_var, style="Status.TLabel").pack(side="left")
-        ttk.Button(footer, text="退出", width=10, command=self.on_exit).pack(side="right")
-        ttk.Button(footer, text="保存到配置文件", width=18, command=self.on_save).pack(side="right", padx=(0, 8))
-        ttk.Button(footer, text="校验", width=10, command=self.on_check).pack(side="right", padx=(0, 8))
-        ttk.Button(footer, text="放弃修改并重载", width=16, command=self.on_reload).pack(side="right", padx=(0, 8))
-        ttk.Button(footer, text="打开备份目录", width=14, command=self.on_open_backup).pack(side="right", padx=(0, 8))
+        ttk.Label(footer, textvariable=self.status_var, style="Status.TLabel",
+                  anchor="w", width=42).grid(row=0, column=0, sticky="w")
+        btns = ttk.Frame(footer)
+        btns.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        ttk.Button(btns, text="打开备份目录", width=14,
+                   command=self.on_open_backup).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="放弃修改并重载", width=16,
+                   command=self.on_reload).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="校验", width=8,
+                   command=self.on_check).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="退出", width=8,
+                   command=self.on_exit).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="保存到配置文件", width=18,
+                   command=self.on_save).pack(side="left")
+        # 快捷键兜底：即使界面缩放异常也能保存/退出
+        for seq in ("<Control-s>", "<Control-S>"):
+            self.root.bind(seq, self._on_shortcut_save)
+        for seq in ("<Control-q>", "<Control-Q>"):
+            self.root.bind(seq, self._on_shortcut_exit)
+
+    def _on_shortcut_save(self, _event: Any = None) -> str:
+        self.on_save()
+        return "break"
+
+    def _on_shortcut_exit(self, _event: Any = None) -> str:
+        self.on_exit()
+        return "break"
 
     def _build_tabs(self) -> None:
         for tab in SCHEMA:
@@ -704,8 +735,89 @@ class ConfigUI:
         self.nb.add(page, text="保留键（只读）")
         self._fill_unmapped(page.inner)
 
+    STATUS_MAX = 42
+
     def status(self, text: str, warn: bool = False) -> None:
+        text = str(text).replace("\n", " ")
+        if len(text) > self.STATUS_MAX:
+            text = "…" + text[-(self.STATUS_MAX - 1):]
         self.status_var.set(text)
+
+    # ---------------------------------------------------------------- 持仓 ⇄ 行情 联动
+    def _market_codes_row(self) -> Optional["FieldRow"]:
+        return self.fields.get(("market", "codes"))
+
+    def market_codes(self) -> List[str]:
+        """当前界面上「监控标的代码」的代码列表。"""
+        row = self._market_codes_row()
+        if row is None:
+            return []
+        return [c for c in split_list(str(row.var.get())) if c]
+
+    def position_editor(self) -> Optional["PositionsEditor"]:
+        for editor in self.editors:
+            if isinstance(editor, PositionsEditor):
+                return editor
+        return None
+
+    def position_codes(self) -> List[str]:
+        editor = self.position_editor()
+        return editor.codes() if editor is not None else []
+
+    def sync_market_codes(self, added: Sequence[str] = (), removed: Sequence[str] = ()) -> List[str]:
+        """把持仓变化同步到「监控标的代码」输入框，返回本次实际变动的代码。"""
+        row = self._market_codes_row()
+        if row is None:
+            return []
+        codes = self.market_codes()
+        touched: List[str] = []
+        drop = {str(c).strip() for c in removed if str(c).strip()}
+        if drop:
+            kept = [c for c in codes if c not in drop]
+            if kept != codes:
+                touched.extend(c for c in codes if c in drop)
+                codes = kept
+        for code in added:
+            code = str(code).strip()
+            if not code or not CODE_RE.match(code):
+                continue
+            if code not in codes:
+                codes.append(code)
+                touched.append(code)
+        if touched:
+            row.var.set(", ".join(codes))
+            self.dirty = True
+        return touched
+
+    def _initial_market_sync(self) -> None:
+        """打开编辑器/重载配置时，把持仓里已有的标的补进行情监控列表。"""
+        positions = self.original.get("positions") or {}
+        pos_codes = [str(k) for k in positions if not str(k).startswith("_")]
+        current = self.market_codes()
+        added = [c for c in pos_codes if c not in current]
+        if not added:
+            return
+        touched = self.sync_market_codes(added=added)
+        if touched:
+            self.status(f"已并入 {len(touched)} 个持仓标的到行情，待保存")
+
+    def _merge_positions_into_market(self, data: Dict[str, Any]) -> List[str]:
+        """保存前的兜底：持仓表里的代码一定并入 market.codes（只增不删）。"""
+        positions = data.get("positions") or {}
+        pos_codes = [str(k) for k in positions if not str(k).startswith("_")]
+        if not pos_codes:
+            return []
+        try:
+            current = path_get(data, ("market", "codes"))
+        except KeyError:
+            current = []
+        codes = [str(c).strip() for c in (current or []) if str(c).strip()]
+        for code in pos_codes:
+            if code not in codes:
+                codes.append(code)
+        if codes:
+            path_set(data, ("market", "codes"), codes)
+        return []
 
     # ---------------------------------------------------------------- 页面构建
     def _fill_page(self, parent: Any, tab: TabSpec) -> None:
@@ -790,6 +902,8 @@ class ConfigUI:
                 editor.apply(data)
             except FieldError as exc:
                 errors.append(str(exc))
+        if not errors:
+            errors.extend(self._merge_positions_into_market(data))
         if not errors:
             errors.extend(validate_config(data))
         return data, errors
@@ -881,6 +995,7 @@ class ConfigUI:
         self.editors.clear()
         self._build_tabs()
         self.status(f"已重新加载 {self.path}")
+        self._initial_market_sync()
 
     def on_open_backup(self) -> None:
         import subprocess
@@ -898,8 +1013,18 @@ class ConfigUI:
 
         data, errors = self.collect()
         if not errors and diff_tree(self.original, data):
-            if not messagebox.askokcancel("退出", "存在未保存的修改，确定退出？"):
+            ans = messagebox.askyesnocancel(
+                "退出",
+                "存在未保存的修改。\n\n是：保存后退出\n否：不保存直接退出\n取消：返回继续编辑",
+            )
+            if ans is None:
                 return
+            if ans:
+                self.on_save()
+                data2, errors2 = self.collect()
+                if errors2 or diff_tree(self.original, data2):
+                    # 保存被取消或失败，保持窗口打开
+                    return
         self.root.destroy()
 
     def run(self) -> None:
@@ -1053,9 +1178,47 @@ class PositionsEditor(BaseEditor):
         ttk.Button(self.body, text="＋ 新增标的",
                    command=lambda: self._add_row("", "", 0, 0, None)).pack(anchor="w", pady=(4, 0))
         ttk.Label(self.body,
+                  text="联动说明：这里新增标的（代码填满 6 位）会自动加入【行情】页的「监控标的代码」；"
+                       "删除某行也会把它从行情监控里移除。只想监控、不持仓的代码请在【行情】页单独添加。",
+                  style="Hint.TLabel", wraplength=980, justify="left").pack(anchor="w", pady=(2, 0))
+        ttk.Label(self.body,
                   text="T+0 勾选说明：只有跨境/债券/黄金/货币 ETF 才能当日买入当日卖出；"
                        "股票与股票 ETF（如 159325 半导体）为 T+1，勾错会让脚本发出当天无法成交的卖出单。",
                   style="Hint.TLabel", wraplength=980, justify="left").pack(anchor="w", pady=(4, 0))
+
+    def codes(self) -> List[str]:
+        """当前界面上持仓表里的代码（按行顺序）。"""
+        out: List[str] = []
+        for row in self.rows:
+            code = str(row["code"].get()).strip()
+            if code:
+                out.append(code)
+        return out
+
+    def _on_code_edit(self, widgets: Dict[str, Any]) -> None:
+        """代码填满 6 位时立即并入行情监控，避免保存后再去行情页补一遍。"""
+        code = str(widgets["code"].get()).strip()
+        if not CODE_RE.match(code):
+            return
+        prev = str(widgets.get("_synced") or "")
+        if prev == code:
+            return
+        if prev and prev not in self.codes():
+            self.ui.sync_market_codes(removed=[prev])
+        widgets["_synced"] = code
+        touched = self.ui.sync_market_codes(added=[code])
+        if touched:
+            self.ui.status(f"{code} 已同步加入行情监控")
+
+    def _sync_removed(self, code: str) -> None:
+        """删除持仓行时同步从行情监控移除（同一代码还有别的行时保留）。"""
+        if not CODE_RE.match(code):
+            return
+        if code in self.codes():
+            return
+        touched = self.ui.sync_market_codes(removed=[code])
+        if touched:
+            self.ui.status(f"{code} 已从行情监控中移除")
 
     def _add_row(self, code: Any, name: Any, cost: Any, qty: Any, t0: Any = None) -> None:
         tk, ttk = self.ui.tk, self.ui.ttk
@@ -1075,12 +1238,16 @@ class PositionsEditor(BaseEditor):
         widgets["frame"] = row
         ttk.Button(row, text="删除", width=6,
                    command=lambda r=widgets: self._remove(r)).pack(side="left")
+        widgets["code"].trace_add("write", lambda *_a, r=widgets: self._on_code_edit(r))
+        widgets["_synced"] = str(code).strip() if CODE_RE.match(str(code).strip()) else ""
         self.rows.append(widgets)
 
     def _remove(self, widgets: Dict[str, Any]) -> None:
+        code = str(widgets["code"].get()).strip()
         if widgets in self.rows:
             self.rows.remove(widgets)
         widgets["frame"].destroy()
+        self._sync_removed(code)
 
     def apply(self, data: Dict[str, Any]) -> None:
         orig = self.ui.original.get("positions", {})
@@ -1485,7 +1652,14 @@ def run_gui_smoke(config_path: Path) -> int:
     for item in errors[:10]:
         print("  " + item)
     print(f"与磁盘差异：{len(diff_tree(ui.original, data))} 处")
-    ok = not errors and not diff_tree(ui.original, data)
+    expect = copy.deepcopy(ui.original)
+    ui._merge_positions_into_market(expect)
+    diffs = diff_tree(expect, data)
+    if diffs:
+        print("联动兜底之外的意外差异：")
+        for path, old, new in diffs[:10]:
+            print(f"  {path}: {old!r} -> {new!r}")
+    ok = not errors and not diffs
     ui.root.update_idletasks()
     ui.root.destroy()
     if ok:
