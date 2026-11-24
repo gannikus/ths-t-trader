@@ -208,7 +208,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "qty_box_sell": [0, 0],
             "sell_button": [0, 0],
         },
-        "_help": "下单窗口为买入/卖出双面板：左侧买入（code_box/price_box/qty_box/buy_button），右侧卖出（*_sell/sell_button）。坐标可用 python main.py --detect --write 自动识别，或 --pick 手动悬停拾取；[0,0] 表示未配置，真实下单会拒绝执行。",
+        "_coords_mode": "",
+        "_coords_ref": {"client_w": 0, "client_h": 0},
+        "_coords_tolerance_px": 8,
+        "_help": "下单窗口为买入/卖出双面板：左侧买入（code_box/price_box/qty_box/buy_button），右侧卖出（*_sell/sell_button）。坐标存的是【下单窗口客户区相对坐标】（相对客户区左上角，单位像素），窗口拖动/最大化/换分辨率/换显示器后依然有效。_coords_mode=client 表示坐标已迁移为客户区相对坐标（由 --detect --write 或 --pick 自动写入）；留空/其它值表示还是旧版屏幕绝对坐标，真实下单前会拒绝使用静态坐标并提示重跑 --detect --write。_coords_ref 记录保存坐标时的客户区尺寸，运行时时若当前客户区尺寸偏差超过 _coords_tolerance_px，将中止下单并要求重新拾取。坐标可用 python main.py --detect --write 自动识别，或 --pick 手动悬停拾取；[0,0] 表示未配置，真实下单会拒绝执行。",
     },
     "ui": {
         "popup_timeout_sec": 10,
@@ -2522,6 +2525,84 @@ class OrderExecutor:
     def coords(self) -> Dict[str, List[int]]:
         return {k: list(v) for k, v in (self.ui_cfg.get("coords") or {}).items()}
 
+    def coords_mode(self) -> str:
+        return str(self.ui_cfg.get("_coords_mode", "") or "").strip().lower()
+
+    def client_coords(self, hwnd: Optional[int]) -> Dict[str, List[int]]:
+        """把 config 里的坐标统一成「下单窗口客户区相对坐标」。
+
+        - _coords_mode=client：本版本写入的相对坐标，原样使用；
+        - 其它（旧版屏幕绝对坐标）：按当前客户区原点做一次性换算，并WARNING提示重拾。
+          这类换算只在窗口位置与保存时一致才成立，所以调用方在不能用实时定位时
+          必须拒绝真实下单（见 _layout_guard / execute）。
+        """
+        c = self.coords()
+        if self.coords_mode() == "client" or not hwnd:
+            return c
+        origin = _client_origin(hwnd)
+        if not origin:
+            return c
+        ox, oy = origin
+        out: Dict[str, List[int]] = {}
+        for k, v in c.items():
+            try:
+                x, y = int(v[0]), int(v[1])
+            except Exception:
+                out[k] = list(v)
+                continue
+            out[k] = [x - ox, y - oy] if (x > 0 and y > 0) else [x, y]
+        self.logger.warning(
+            "order_ui.coords 仍是旧版屏幕绝对坐标，已按当前客户区原点(%s,%s)临时换算；"
+            "请执行 python main.py --detect --write 重新写入相对坐标", ox, oy)
+        return out
+
+    def coords_trusted(self) -> bool:
+        """静态坐标是否为可信的客户区相对坐标。"""
+        return self.coords_mode() == "client"
+
+    def layout_guard(self, hwnd: int) -> str:
+        """校验当前客户区尺寸与保存坐标时的尺寸是否一致；不一致返回中止原因。"""
+        ref = self.ui_cfg.get("_coords_ref") or {}
+        try:
+            tol = int(self.ui_cfg.get("_coords_tolerance_px", 8) or 8)
+        except Exception:
+            tol = 8
+        cur = _client_size(hwnd)
+        if not ref or not cur:
+            return ""
+        try:
+            rw = int(ref.get("client_w") or 0)
+            rh = int(ref.get("client_h") or 0)
+        except Exception:
+            return ""
+        if rw <= 0 or rh <= 0:
+            return ""
+        if abs(cur[0] - rw) > tol or abs(cur[1] - rh) > tol:
+            return (f"下单窗口客户区尺寸已变化：保存坐标时 {rw}x{rh}，当前 {cur[0]}x{cur[1]}"
+                    f"（容差 {tol}px），静态坐标已不可信；请重新执行 --detect --write 或 --pick 后再下单")
+        return ""
+
+    def screen_steps(self, hwnd: Optional[int],
+                     steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把客户区相对坐标换算成屏幕绝对坐标，供点击与遮挡检查使用。"""
+        if not hwnd:
+            return [dict(st) for st in steps]
+        origin = _client_origin(hwnd)
+        if not origin:
+            return [dict(st) for st in steps]
+        ox, oy = origin
+        out: List[Dict[str, Any]] = []
+        for st in steps:
+            item = dict(st)
+            xy = item.get("coord")
+            if xy:
+                try:
+                    item["coord"] = [int(xy[0]) + ox, int(xy[1]) + oy]
+                except Exception:
+                    pass
+            out.append(item)
+        return out
+
     def qty_text(self, signal: Signal) -> str:
         qty = float(signal.suggested_qty)
         unit = str(self.ui_cfg.get("qty_unit", "shares")).lower()
@@ -2576,31 +2657,34 @@ class OrderExecutor:
         for st in steps:
             if st["type"] in ("click", "click_type"):
                 xy = st.get("coord") or [0, 0]
-                if not xy or int(xy[0]) <= 0 or int(xy[1]) <= 0:
+                # 客户区相对坐标下，控件可能正好贴边（x=0 或 y=0 单侧为 0 仍有效），
+                # 只有两轴都不大于 0 才判定为「未配置 [0,0]」。
+                if not xy or (int(xy[0]) <= 0 and int(xy[1]) <= 0):
                     missing.append(st["name"])
         return missing
 
     # ---- 主执行入口 ----
     def execute(self, signal: Signal) -> Dict[str, Any]:
-        steps = self.plan(signal)
-        coords_text = json.dumps(
-            {st["name"]: st.get("coord") for st in steps if st.get("coord")}, ensure_ascii=False
-        )
+        hwnd = _find_order_window()
+        base = self.client_coords(hwnd)
+        steps = self.plan(signal, coords=base)
+        coords_text = _coords_summary(hwnd, steps)
         missing = self._missing_coords(steps)
 
         if self.dry_run:
             if self.ui_cfg.get("locate_at_runtime", True):
                 live = self._live_coords()
                 if live:
-                    steps = self.plan(signal, coords=self._merge_coords(live))
-                    coords_text = json.dumps(
-                        {st["name"]: st.get("coord") for st in steps if st.get("coord")},
-                        ensure_ascii=False,
-                    )
-            detail = "DRY_RUN：仅规划动作，不操作鼠标。动作序列=" + json.dumps(
-                [{"step": st["name"], "coord": st.get("coord"), "text": st.get("text")} for st in steps],
-                ensure_ascii=False,
-            )
+                    merged = dict(base)
+                    merged.update(live)
+                    steps = self.plan(signal, coords=merged)
+                    coords_text = _coords_summary(hwnd, steps)
+            detail = ("DRY_RUN：仅规划动作，不操作鼠标（坐标为下单窗口客户区相对坐标）。动作序列="
+                      + json.dumps(
+                          [{"step": st["name"], "coord": st.get("coord"), "text": st.get("text")}
+                           for st in steps],
+                          ensure_ascii=False,
+                      ))
             self.logger.info("[DRY_RUN] %s %s", signal.signal_id, detail)
             return {"status": "DRY_RUN", "detail": detail, "coords": coords_text, "clicked": []}
 
@@ -2618,11 +2702,7 @@ class OrderExecutor:
             return {"status": "ABORTED_NO_PYAUTOGUI", "detail": detail, "coords": coords_text, "clicked": []}
 
         if self.ui_cfg.get("dpi_aware", True):
-            try:
-                import ctypes
-                ctypes.windll.shcore.SetProcessDpiAwareness(2)
-            except Exception:
-                pass
+            ensure_dpi_aware()
 
         pyautogui.FAILSAFE = True
         pyautogui.PAUSE = 0.05
@@ -2639,15 +2719,30 @@ class OrderExecutor:
             # 运行时实时定位：窗口被拖动、换分辨率或客户端换布局后，config 里的静态坐标
             # 会全部偏移（实测窗口移动 275px 后旧坐标就会点到别处）。这里在真正点击前
             # 按控件重新枚举一次，成功则覆盖静态坐标；失败才回退 config。
-            if self.ui_cfg.get("locate_at_runtime", True):
-                live = self._live_coords()
-                if live:
-                    steps = self.plan(signal, coords=self._merge_coords(live))
-                    coords_text = json.dumps(
-                        {st["name"]: st.get("coord") for st in steps if st.get("coord")},
-                        ensure_ascii=False,
-                    )
-                    missing = self._missing_coords(steps)
+            live = self._live_coords() if self.ui_cfg.get("locate_at_runtime", True) else {}
+            if live:
+                merged = dict(base)
+                merged.update(live)
+                steps = self.plan(signal, coords=merged)
+                missing = self._missing_coords(steps)
+            else:
+                # 实时定位不可用，只能信 config 静态坐标：必须是本版本写入的客户区相对坐标，
+                # 且当前客户区尺寸与保存时一致，否则坐标可能整体偏移，宁可中止也不误点。
+                guard = self.layout_guard(hwnd)
+                if not guard and not self.coords_trusted() and any(
+                        int(v[0]) > 0 or int(v[1]) > 0
+                        for v in [vv for vv in base.values() if len(vv) >= 2]):
+                    guard = ("config 里的坐标尚未迁移为客户区相对坐标（旧版屏幕绝对坐标），"
+                             "窗口一移动就会点错位置；请执行 python main.py --detect --write 重新写入")
+                if guard:
+                    detail = "真实下单已中止：" + guard
+                    self.logger.error(detail)
+                    return {"status": "ABORTED_LAYOUT_CHANGED", "detail": detail,
+                            "coords": coords_text, "clicked": clicked}
+
+            coords_text = _coords_summary(hwnd, steps)
+            # 点击与遮挡检查都要屏幕绝对坐标，这里统一换算一次
+            steps = self.screen_steps(hwnd, steps)
 
             if missing:
                 detail = ("真实下单已中止：以下坐标未配置 -> " + "、".join(missing)
@@ -2658,7 +2753,7 @@ class OrderExecutor:
 
             # 遮挡校验：坐标取自控件矩形中心，本身正确；但若有别的窗口浮在同花顺之上
             # （如安卓模拟器、聊天窗），鼠标会点到那个窗口，导致误操作到无关程序。
-            blocked = check_overlay_blocking(steps, _find_order_window())
+            blocked = check_overlay_blocking(steps, hwnd)
             if blocked:
                 detail = ("真实下单已中止：以下操作点被其它窗口遮挡 -> " + "、".join(blocked)
                           + "；请把同花顺下单窗口切到最前，或移开/最小化遮挡窗口后重试")
@@ -3862,6 +3957,100 @@ def _find_order_window() -> Optional[int]:
     return cands[0] if cands else None
 
 
+# ---------------------------------------------------------------------------------------
+# 坐标空间工具：全部坐标以「下单窗口客户区相对坐标」存储，点击前才换算成屏幕绝对坐标。
+# 这样窗口被拖动、最大化、换分辨率、换显示器都不会让坐标失效。
+# ---------------------------------------------------------------------------------------
+_DPI_READY = False
+
+
+def ensure_dpi_aware() -> None:
+    """把进程统一到 per-monitor v2 DPI 感知级别。
+
+    拾取端（--pick / --detect / 配置编辑器）与执行端必须在同一感知级别，否则系统会对
+    坐标做虚拟化缩放，出现「窗口没动坐标也偏」的问题。
+    """
+    global _DPI_READY
+    if _DPI_READY:
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    _DPI_READY = True
+
+
+def _client_origin(hwnd: Optional[int]) -> Optional[Tuple[int, int]]:
+    """下单窗口客户区左上角对应的屏幕坐标；取不到返回 None。"""
+    if win32gui is None or not hwnd:
+        return None
+    try:
+        x, y = win32gui.ClientToScreen(int(hwnd), (0, 0))
+        return int(x), int(y)
+    except Exception:
+        return None
+
+
+def _client_size(hwnd: Optional[int]) -> Optional[Tuple[int, int]]:
+    """下单窗口客户区尺寸 (宽, 高)；取不到返回 None。"""
+    if win32gui is None or not hwnd:
+        return None
+    try:
+        l, t, r, b = win32gui.GetClientRect(int(hwnd))
+        w, h = int(r - l), int(b - t)
+        if w <= 0 or h <= 0:
+            return None
+        return w, h
+    except Exception:
+        return None
+
+
+def client_to_screen(hwnd: Optional[int], xy: Any) -> List[int]:
+    """客户区相对坐标 -> 屏幕绝对坐标；窗口取不到时原样返回。"""
+    try:
+        x, y = int(xy[0]), int(xy[1])
+    except Exception:
+        return [0, 0]
+    origin = _client_origin(hwnd)
+    if not origin:
+        return [x, y]
+    return [x + origin[0], y + origin[1]]
+
+
+def screen_to_client(hwnd: Optional[int], xy: Any) -> Optional[List[int]]:
+    """屏幕绝对坐标 -> 客户区相对坐标；窗口取不到时返回 None。"""
+    try:
+        x, y = int(xy[0]), int(xy[1])
+    except Exception:
+        return None
+    origin = _client_origin(hwnd)
+    if not origin:
+        return None
+    return [x - origin[0], y - origin[1]]
+
+
+def _coords_summary(hwnd: Optional[int], steps: List[Dict[str, Any]]) -> str:
+    """把动作序列的坐标同时以「客户区相对」和「屏幕绝对」两种形态序列化，便于日志核对。"""
+    origin = _client_origin(hwnd) if hwnd else None
+    out: Dict[str, Any] = {}
+    for st in steps:
+        xy = st.get("coord")
+        if not xy:
+            continue
+        item: Dict[str, Any] = {"client": [int(xy[0]), int(xy[1])]}
+        if origin:
+            item["screen"] = [int(xy[0]) + origin[0], int(xy[1]) + origin[1]]
+        out[st["name"]] = item
+    return json.dumps(out, ensure_ascii=False)
+
+
 def _enum_child_items(hwnd: int) -> List[Dict[str, Any]]:
     """枚举窗口内所有子控件及其屏幕矩形。"""
     items: List[Dict[str, Any]] = []
@@ -4155,6 +4344,10 @@ def detect_order_coords() -> Tuple[Dict[str, List[int]], List[str], str]:
     items = _enum_child_items(hwnd)
     if not items:
         return {}, [], f"下单窗口「{title}」内未枚举到控件（可能被最小化）"
+    origin = _client_origin(hwnd)
+    if origin is None:
+        return {}, [], f"下单窗口「{title}」客户区原点读取失败（可能被最小化），无法生成相对坐标"
+    ox, oy = origin
 
     edits = [i for i in items if i["cls"] == "Edit" and i["w"] >= 20 and i["h"] >= 8]
     by_text: Dict[str, Dict[str, Any]] = {}
@@ -4219,7 +4412,7 @@ def detect_order_coords() -> Tuple[Dict[str, List[int]], List[str], str]:
             (f"qty_box{prefix}", qty_e, f"{side_cn}数量输入框"),
         ):
             if ent:
-                coords[key] = [ent["cx"], ent["cy"]]
+                coords[key] = [ent["cx"] - ox, ent["cy"] - oy]
             else:
                 missing.append(f"{key}({label})")
 
@@ -4231,16 +4424,19 @@ def detect_order_coords() -> Tuple[Dict[str, List[int]], List[str], str]:
             # 买入侧取最靠左/最靠上的按钮
             btn = min(btns, key=lambda i: (i["rect"][1], i["rect"][0])) if btns else None
         if btn:
-            coords[btn_key] = [btn["cx"], btn["cy"]]
+            coords[btn_key] = [btn["cx"] - ox, btn["cy"] - oy]
         else:
             missing.append(f"{btn_key}({btn_label})")
 
     _side("", "买入", "买入股票", "买入", "buy_button", "买入按钮")
     _side("_sell", "卖出", "卖出股票", "卖出", "sell_button", "卖出按钮")
 
+    size = _client_size(hwnd)
+    size_text = f"{size[0]}x{size[1]}" if size else "未知"
     detail = (
         f"下单窗口「{title}」hwnd={hwnd}，控件 {len(items)} 个，编辑框 {len(edits)} 个"
-        f"（买入侧 + 卖出侧双面板）"
+        f"（买入侧 + 卖出侧双面板）；客户区原点(屏幕)=({ox},{oy})，客户区尺寸={size_text}，"
+        f"以下坐标均为客户区相对坐标"
     )
     return coords, missing, detail
 
@@ -4257,6 +4453,12 @@ def save_coords(config_path: Path, coords: Dict[str, List[int]]) -> bool:
     cur = oui.setdefault("coords", {})
     for k, v in coords.items():
         cur[k] = [int(v[0]), int(v[1])]
+    # 标记坐标空间已迁移为客户区相对坐标，并记录保存时的客户区尺寸用于运行时校验
+    oui["_coords_mode"] = "client"
+    hwnd = _find_order_window()
+    size = _client_size(hwnd) if hwnd else None
+    if size:
+        oui["_coords_ref"] = {"client_w": int(size[0]), "client_h": int(size[1])}
     try:
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(raw, f, ensure_ascii=False, indent=2)
@@ -4268,6 +4470,7 @@ def save_coords(config_path: Path, coords: Dict[str, List[int]]) -> bool:
 
 def cmd_detect(cfg: Dict[str, Any], config_path: Path, write: bool = False) -> int:
     """自动识别下单界面 8 个操作点（买入侧 4 + 卖出侧 4）；write=True 时写入配置。"""
+    ensure_dpi_aware()
     coords, missing, detail = detect_order_coords()
     print("\n=== 下单界面坐标自动识别 ===")
     print(f"  {detail}")
@@ -4276,13 +4479,18 @@ def cmd_detect(cfg: Dict[str, Any], config_path: Path, write: bool = False) -> i
         return 2
     order = ORDER_COORD_KEYS
     label = ORDER_COORD_LABELS
+    hwnd = _find_order_window()
+    origin = _client_origin(hwnd) if hwnd else None
     for k in order:
         if k in coords:
-            print(f"  ✔ {label[k]:<12} {k:<12} = [{coords[k][0]}, {coords[k][1]}]")
+            cx, cy = coords[k][0], coords[k][1]
+            sx, sy = (cx + origin[0], cy + origin[1]) if origin else (cx, cy)
+            print(f"  ✔ {label[k]:<12} {k:<12} = 客户区[{cx}, {cy}] 屏幕[{sx}, {sy}]")
     if missing:
         print("  ✗ 未识别：" + "、".join(missing))
         print("    可改用 `python main.py --pick --manual` 手动悬停记录这些点。")
-    probe = [{"name": label[k], "type": "click", "coord": coords[k]}
+    probe = [{"name": label[k], "type": "click",
+              "coord": client_to_screen(hwnd, coords[k])}
              for k in order if k in coords]
     blocked = check_overlay_blocking(probe, _find_order_window())
     if blocked:
@@ -4313,6 +4521,7 @@ def cmd_pick(cfg: Dict[str, Any], config_path: Path, extra_vk: Optional[int] = N
         print("✗ 缺少 pywin32，无法拾取坐标（pip install pywin32）")
         return 2
     _pick_console_guard()
+    ensure_dpi_aware()  # 先声明 DPI 感知再读鼠标坐标，否则高缩放下拾取值与控件矩形不同口径
     names = [
         ("code_box", "左侧【买入】面板-证券代码输入框"),
         ("price_box", "左侧【买入】面板-买入价格输入框"),
@@ -4377,9 +4586,31 @@ def cmd_pick(cfg: Dict[str, Any], config_path: Path, extra_vk: Optional[int] = N
                     prev_key = _pick_pressed(extra_vk)
                     time.sleep(0.2)
                     continue
-                recorded[code] = [x, y]
+                # 落盘统一存「下单窗口客户区相对坐标」：每次记录时实时取客户区原点，
+                # 这样拾取期间窗口被拖动也不会记错（旧版存屏幕绝对坐标，窗口一动就失效）。
+                hwnd_now = _find_order_window()
+                origin = _client_origin(hwnd_now) if hwnd_now else None
+                if not origin:
+                    print("    ✗ 未找到同花顺下单窗口，无法换算客户区坐标；请先打开下单界面后重新悬停。")
+                    _pick_beep(False)
+                    still_since = time.time()
+                    armed = False
+                    prev_key = _pick_pressed(extra_vk)
+                    time.sleep(0.2)
+                    continue
+                rx, ry = x - origin[0], y - origin[1]
+                if rx < 0 or ry < 0:
+                    print(f"    ✗ 拾取点屏幕({x}, {y}) 落在下单窗口客户区之外"
+                          f"（相对坐标 {rx},{ry}），请重新悬停到窗口内控件上。")
+                    _pick_beep(False)
+                    still_since = time.time()
+                    armed = False
+                    prev_key = _pick_pressed(extra_vk)
+                    time.sleep(0.2)
+                    continue
+                recorded[code] = [rx, ry]
                 _pick_beep(True)
-                print(f"    ✔ {code} = [{x}, {y}]  （{idx + 1}/{len(names)}）")
+                print(f"    ✔ {code} = 客户区[{rx}, {ry}]（屏幕[{x}, {y}]）  （{idx + 1}/{len(names)}）")
                 idx += 1
                 time.sleep(0.25)
                 break
@@ -4387,12 +4618,21 @@ def cmd_pick(cfg: Dict[str, Any], config_path: Path, extra_vk: Optional[int] = N
 
     with open(config_path, "r", encoding="utf-8") as fh:
         raw = json.load(fh)
-    raw.setdefault("order_ui", {}).setdefault("coords", {}).update(recorded)
+    oui = raw.setdefault("order_ui", {})
+    oui.setdefault("coords", {}).update(recorded)
+    oui["_coords_mode"] = "client"
+    hwnd_end = _find_order_window()
+    size_end = _client_size(hwnd_end) if hwnd_end else None
+    if size_end:
+        oui["_coords_ref"] = {"client_w": int(size_end[0]), "client_h": int(size_end[1])}
     with open(config_path, "w", encoding="utf-8") as fh:
         json.dump(raw, fh, ensure_ascii=False, indent=2)
     print(f"\n已写入 {config_path}")
     print(json.dumps(recorded, ensure_ascii=False, indent=2))
-    print("提示：确认这些坐标在真实下单窗口中可用；切换分辨率/缩放后需要重新拾取。")
+    if size_end:
+        print(f"客户区参照尺寸：{int(size_end[0])}x{int(size_end[1])}（客户区尺寸变化时会拒绝使用静态坐标）")
+    print("提示：坐标存的是下单窗口客户区相对坐标，移动窗口无需重拾；"
+          "仅当客户区尺寸/系统缩放变化时才需重新拾取。")
     return 0
 
 
@@ -4427,11 +4667,7 @@ def cmd_test_order(cfg: Dict[str, Any], logger: logging.Logger, side: str = "buy
         print("✘ 缺少 pyautogui：pip install pyautogui")
         return 1
     if ui.get("dpi_aware", True):
-        try:
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        except Exception:
-            pass
+        ensure_dpi_aware()
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE = 0.05
 
@@ -4454,17 +4690,36 @@ def cmd_test_order(cfg: Dict[str, Any], logger: logging.Logger, side: str = "buy
         print("✘ 坐标识别不完整：" + "、".join(missing) + (f"（{detail}）" if detail else ""))
         return 1
     coords = dict(ui.get("coords") or {})
-    coords.update({k: v for k, v in live.items() if v})
-    print("实时定位坐标：" + json.dumps(coords, ensure_ascii=False))
+    origin = _client_origin(hwnd)
+    if not origin:
+        print("✘ 取不到下单窗口客户区原点，已中止（窗口可能已关闭）")
+        return 1
+    if str(ui.get("_coords_mode", "") or "").strip().lower() != "client":
+        # config 仍是旧版屏幕绝对坐标，先按当前客户区原点换算成相对坐标再统一处理
+        ox0, oy0 = origin
+        coords = {k: [int(v[0]) - ox0, int(v[1]) - oy0]
+                  for k, v in coords.items() if len(v) >= 2}
+        print("（config 内为旧版屏幕绝对坐标，已按当前客户区原点临时换算；建议重跑 --detect --write）")
+    coords.update({k: v for k, v in live.items() if v})  # detect_order_coords 返回的已是相对坐标
+    ox, oy = origin
+    print(f"实时定位坐标（客户区相对，原点屏幕({ox},{oy})）：" + json.dumps(coords, ensure_ascii=False))
+
+    def _abs(xy: Optional[List[int]]) -> Optional[List[int]]:
+        if not xy or len(xy) < 2:
+            return None
+        return [int(xy[0]) + ox, int(xy[1]) + oy]
 
     is_buy = side == "buy"
     sfx = "" if is_buy else "_sell"
     side_cn = "买入" if is_buy else "卖出"
     steps = [
-        {"name": f"点击{side_cn}侧证券代码框", "coord": coords.get("code_box" + sfx), "text": digits},
-        {"name": f"点击{side_cn}侧价格框", "coord": coords.get("price_box" + sfx), "text": None},
-        {"name": f"点击{side_cn}侧数量框", "coord": coords.get("qty_box" + sfx), "text": None},
+        {"name": f"点击{side_cn}侧证券代码框", "coord": _abs(coords.get("code_box" + sfx)), "text": digits},
+        {"name": f"点击{side_cn}侧价格框", "coord": _abs(coords.get("price_box" + sfx)), "text": None},
+        {"name": f"点击{side_cn}侧数量框", "coord": _abs(coords.get("qty_box" + sfx)), "text": None},
     ]
+    if any(st["coord"] is None for st in steps):
+        print("✘ 缺少必要的输入框坐标，请先执行 python main.py --detect --write")
+        return 1
 
     if price is None:
         price = 0.0
@@ -4515,7 +4770,11 @@ def cmd_test_order(cfg: Dict[str, Any], logger: logging.Logger, side: str = "buy
     dialog_res: Optional[DialogResult] = None
     if submit:
         btn_key = "buy_button" if is_buy else "sell_button"
-        bx, by = coords[btn_key]
+        bxy = _abs(coords.get(btn_key))
+        if not bxy:
+            print(f"✘ 缺少{side_cn}按钮坐标，已中止（不产生任何委托）")
+            return 1
+        bx, by = bxy
         print(f"  → 点击{side_cn}按钮 [{bx},{by}]（真实提交）")
         pyautogui.click(bx, by)
         time.sleep(0.3)
@@ -4598,6 +4857,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     config_path = Path(args.config)
     cfg = load_config(config_path)
     logger = setup_runtime_logger(cfg)
+    # 进程启动即声明 DPI 感知：若等到点击前才设置，之前创建的 Tk 窗口会重置
+    # 进程 DPI 上下文，导致坐标换算与实际像素不一致（拾取/定位两端必须同口径）。
+    ensure_dpi_aware()
 
     print(f"{APP_NAME} v{VERSION}")
     print(f"配置文件：{config_path}")

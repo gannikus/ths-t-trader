@@ -612,7 +612,10 @@ def _enable_dpi() -> None:
         import ctypes
 
         try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            # 与 main.py 的 ensure_dpi_aware() 保持同一级别（per-monitor v2）：
+            # 编辑器若用 (1) system-aware，多屏不同缩放下 winfo_pointerxy 读到的
+            # 坐标与执行端 ClientToScreen 换算口径不一致，会出现整体偏移。
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
             ctypes.windll.user32.SetProcessDPIAware()
     except Exception:
@@ -1411,15 +1414,438 @@ COORD_FIELDS: List[Tuple[str, str]] = [
 ]
 
 
+def _find_order_hwnd() -> Optional[int]:
+    """查找同花顺下单窗口（标题/类名口径与 main.py 的 _find_order_window 一致）。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:  # noqa: BLE001
+        return None
+    user32 = ctypes.windll.user32
+    found: List[int] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _cb(hwnd: int, _lparam: int) -> bool:  # noqa: ANN001
+        try:
+            # 与 main.py 保持一致：必须可见，否则会匹配到同花顺遗留的隐藏 Afx 窗口
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            if not length:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value
+            cls = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, cls, 256)
+            if "网上股票交易系统" in title or ("交易系统" in title and cls.value.startswith("Afx")):
+                found.append(int(hwnd))
+                return False
+        except Exception:  # noqa: BLE001
+            return True
+        return True
+
+    try:
+        user32.EnumWindows(_cb, 0)
+    except Exception:  # noqa: BLE001
+        return None
+    return found[0] if found else None
+
+
+def _client_origin(hwnd: Optional[int]) -> Optional[Tuple[int, int]]:
+    """下单窗口客户区左上角的屏幕坐标。"""
+    if not hwnd:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        pt = wintypes.POINT(0, 0)
+        if not ctypes.windll.user32.ClientToScreen(wintypes.HWND(hwnd), ctypes.byref(pt)):
+            return None
+        return int(pt.x), int(pt.y)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _client_size(hwnd: Optional[int]) -> Optional[Tuple[int, int]]:
+    """下单窗口客户区尺寸。"""
+    if not hwnd:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        rect = wintypes.RECT()
+        if not ctypes.windll.user32.GetClientRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+            return None
+        return int(rect.right - rect.left), int(rect.bottom - rect.top)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ---------- 坐标测试：置前 / 遮挡判定 / 鼠标键盘模拟（仅 Windows） ----------
+
+COORD_TEST_VALUES: Dict[str, str] = {
+    "code_box": "000001",
+    "code_box_sell": "000001",
+    "price_box": "9.99",
+    "price_box_sell": "9.99",
+    "qty_box": "100",
+    "qty_box_sell": "100",
+}
+
+
+def _win_root_at(x: int, y: int) -> Optional[int]:
+    """屏幕坐标点上最顶层窗口的根句柄；取不到返回 None（调用方按无法判定处理）。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        hwnd = user32.WindowFromPoint(wintypes.POINT(int(x), int(y)))
+        if not hwnd:
+            return None
+        root = user32.GetAncestor(wintypes.HWND(hwnd), 2)  # GA_ROOT
+        return int(root) if root else int(hwnd)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _foreground_hwnd() -> Optional[int]:
+    try:
+        import ctypes
+
+        value = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+        return value or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _activate_window(hwnd: Optional[int]) -> bool:
+    """把下单窗口切到最前面，并等它真正拿到焦点。"""
+    if not hwnd:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        user32.ShowWindow(wintypes.HWND(hwnd), 9)  # SW_RESTORE
+        user32.SetForegroundWindow(wintypes.HWND(hwnd))
+        for _ in range(12):
+            if _foreground_hwnd() == int(hwnd):
+                return True
+            time.sleep(0.05)
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _move_cursor(x: int, y: int) -> None:
+    import ctypes
+
+    ctypes.windll.user32.SetCursorPos(int(x), int(y))
+
+
+def _click_left(x: int, y: int) -> None:
+    """移动鼠标并单击左键（只负责点下去，不判断点到的是什么）。"""
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    user32.SetCursorPos(int(x), int(y))
+    time.sleep(0.08)
+    user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+    time.sleep(0.04)
+    user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+
+
+def _key(vk: int, up: bool = False) -> None:
+    import ctypes
+
+    ctypes.windll.user32.keybd_event(int(vk), 0, 2 if up else 0, 0)
+
+
+def _press(vk: int) -> None:
+    _key(vk, False)
+    time.sleep(0.02)
+    _key(vk, True)
+
+
+def _type_text(text: str) -> None:
+    """模拟主键盘输入数字与小数点（坐标测试够用）。"""
+    for ch in str(text):
+        if ch.isdigit():
+            _press(0x30 + int(ch))
+        elif ch == ".":
+            _press(0xBE)  # VK_OEM_PERIOD
+
+
+def _focus_hwnd(hwnd: Optional[int]) -> Optional[int]:
+    """取指定窗口所属线程当前的焦点控件。
+
+    跨进程/跨线程调用 GetFocus() 一律返回空，必须经 GetGUIThreadInfo 按线程查。
+    """
+    if not hwnd:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+
+        class GUITHREADINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("hwndActive", ctypes.c_void_p),
+                ("hwndFocus", ctypes.c_void_p),
+                ("hwndCapture", ctypes.c_void_p),
+                ("hwndMenuOwner", ctypes.c_void_p),
+                ("hwndMoveSize", ctypes.c_void_p),
+                ("hwndCaret", ctypes.c_void_p),
+                ("rcCaret", wintypes.RECT),
+            ]
+
+        user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.c_void_p]
+        user32.GetGUIThreadInfo.restype = ctypes.c_int
+
+        tid = user32.GetWindowThreadProcessId(ctypes.c_void_p(int(hwnd)), None)
+        if not tid:
+            return None
+        info = GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(GUITHREADINFO)
+        if not user32.GetGUIThreadInfo(wintypes.DWORD(int(tid)), ctypes.byref(info)):
+            return None
+        return int(info.hwndFocus) if info.hwndFocus else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _related_windows(a: Optional[int], b: Optional[int]) -> bool:
+    """两个句柄是否为同一控件，或存在父子关系。"""
+    if not a or not b:
+        return False
+    if int(a) == int(b):
+        return True
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        user32.GetParent.argtypes = [ctypes.c_void_p]
+        user32.GetParent.restype = ctypes.c_void_p
+        for start, other in ((int(a), int(b)), (int(b), int(a))):
+            cur = start
+            for _ in range(8):
+                parent = user32.GetParent(ctypes.c_void_p(cur))
+                if not parent:
+                    break
+                cur = int(parent)
+                if cur == other:
+                    return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
+def _window_class(hwnd: Optional[int]) -> str:
+    """取窗口类名，取不到返回空串。"""
+    if not hwnd:
+        return ""
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+        user32.GetClassNameW.restype = ctypes.c_int
+        buf = ctypes.create_unicode_buffer(256)
+        n = user32.GetClassNameW(ctypes.c_void_p(int(hwnd)), buf, 256)
+        return buf.value if n else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _client_rect(hwnd: Optional[int], root: Optional[int]) -> Optional[Tuple[int, int, int, int]]:
+    """把控件矩形换算成下单窗口客户区坐标，返回 (x1, y1, x2, y2)。"""
+    if not hwnd or not root:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        rc = wintypes.RECT()
+        if not user32.GetWindowRect(wintypes.HWND(int(hwnd)), ctypes.byref(rc)):
+            return None
+        origin = wintypes.POINT(0, 0)
+        if not user32.ClientToScreen(wintypes.HWND(int(root)), ctypes.byref(origin)):
+            return None
+        ox, oy = origin.x, origin.y
+        return (rc.left - ox, rc.top - oy, rc.right - ox, rc.bottom - oy)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _same_side_inputs(target_rect: Optional[Tuple[int, int, int, int]],
+                      root: Optional[int], tol: int = 24) -> list:
+    """列出与目标控件同列的输入框，返回按 y 升序的 [(y, 宽, hwnd), ...]，供人工对照。"""
+    if not target_rect or not root:
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        found = []
+        proto = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(h, _lp):
+            if _window_class(h).lower() not in ("edit", "tedit", "richedit", "richedit20w", "richedit50w"):
+                return True
+            r = _client_rect(h, root)
+            if r and abs(r[0] - target_rect[0]) <= tol:
+                found.append((r[1], r[2] - r[0], int(h)))
+            return True
+
+        user32.EnumChildWindows(wintypes.HWND(int(root)), proto(_cb), 0)
+        found.sort()
+        return found
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _clear_field_hard() -> None:
+    """清空当前获得焦点的输入框，序列与真实下单完全一致：Ctrl+A → Delete → Backspace×8。
+
+    2026-11-24 实测（同花顺远航版下单窗口 hwnd=68784，买入价格框 hwnd=70358）：
+    · Ctrl+A → Delete → Backspace×8 能把价格框清空到与基线零像素差，焦点全程停留在原控件；
+    · 绝对不能用 Home / End / Shift+End —— 价格框不消费 End 键，End 被对话框导航逻辑
+      当成控件跳转，焦点会直接跑到代码框（hwnd=70348），之后 Delete / Backspace 以及
+      输入的数字全部落进代码框，表现为「试填价格填到了代码框里」。
+    """
+    VK_CONTROL, VK_A = 0x11, 0x41
+    VK_DELETE, VK_BACK = 0x2E, 0x08
+    _key(VK_CONTROL, False)
+    _press(VK_A)
+    _key(VK_CONTROL, True)
+    time.sleep(0.05)
+    _press(VK_DELETE)
+    time.sleep(0.02)
+    for _ in range(8):
+        _press(VK_BACK)
+        time.sleep(0.015)
+
+
+def _class_name(hwnd: Optional[int]) -> str:
+    """控件类名（Edit / ComboBox / Button …）。"""
+    if not hwnd:
+        return ""
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+        user32.GetClassNameW.restype = ctypes.c_int
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(ctypes.c_void_p(int(hwnd)), buf, 256)
+        return buf.value
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _probe_child_at(x: int, y: int) -> Tuple[Optional[int], str]:
+    """屏幕坐标点上的子窗口句柄与其类名（只读探测）。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        user32.WindowFromPoint.restype = ctypes.c_void_p
+        hwnd = user32.WindowFromPoint(wintypes.POINT(int(x), int(y)))
+        if not hwnd:
+            return None, ""
+        handle = int(hwnd)
+        return handle, _class_name(handle)
+    except Exception:  # noqa: BLE001
+        return None, ""
+
+
+def _is_text_control(cls: str) -> bool:
+    lower = str(cls or "").lower()
+    return any(lower.startswith(p) for p in ("edit", "tedit", "richedit", "combobox"))
+
+
+def _read_window_text(hwnd: Optional[int], length: int = 64) -> Optional[str]:
+    """读控件当前文本（只读，用于校验试填值与清空结果）。"""
+    if not hwnd:
+        return None
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+        user32.SendMessageW.restype = ctypes.c_ssize_t
+        buf = ctypes.create_unicode_buffer(int(length))
+        user32.SendMessageW(
+            ctypes.c_void_p(int(hwnd)),
+            0x000D,  # WM_GETTEXT
+            ctypes.c_size_t(int(length)),
+            ctypes.c_ssize_t(ctypes.addressof(buf)),
+        )
+        return buf.value
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _set_window_text(hwnd: Optional[int], text: str = "") -> bool:
+    """直接给控件置文本，仅作为清空兜底（清空没有副作用）。"""
+    if not hwnd:
+        return False
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        user32.SetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        user32.SetWindowTextW.restype = ctypes.c_int
+        return bool(user32.SetWindowTextW(ctypes.c_void_p(int(hwnd)), str(text)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _select_all_and_clear() -> None:  # 兼容旧调用点
+    _clear_field_hard()
+
+
 class CoordsEditor(BaseEditor):
     path = ("order_ui", "coords")
-    title = "下单界面坐标（屏幕绝对像素）"
+    title = "下单界面坐标（下单窗口客户区相对像素）"
 
     def __init__(self, ui: ConfigUI, parent: Any) -> None:
         super().__init__(ui, parent)
         tk, ttk = ui.tk, ui.ttk
         self.rows: Dict[str, Tuple[Any, Any]] = {}
-        coords = ui.original.get("order_ui", {}).get("coords", {}) or {}
+        coords = dict(ui.original.get("order_ui", {}).get("coords", {}) or {})
+        oui_orig = ui.original.get("order_ui", {}) or {}
+        legacy = str(oui_orig.get("_coords_mode", "") or "").strip().lower() != "client"
+        notice = ""
+        if legacy and coords:
+            # 旧版存的是屏幕绝对坐标：先换算成客户区相对坐标再显示，
+            # 否则用户点保存会把这些值当成相对坐标打上 client 标记，导致整体偏移。
+            origin = _client_origin(_find_order_hwnd())
+            if origin:
+                ox, oy = origin
+                coords = {
+                    k: ([int(v[0]) - ox, int(v[1]) - oy]
+                        if isinstance(v, (list, tuple)) and len(v) >= 2 else v)
+                    for k, v in coords.items()
+                }
+                notice = ("　【注意】配置里是旧版屏幕绝对坐标，已按当前下单窗口自动换算为客户区相对坐标，"
+                          "建议逐项重拾一遍确认。")
+            else:
+                notice = ("　【注意】配置里是旧版屏幕绝对坐标，且当前未找到下单窗口（标题需含"
+                          "「网上股票交易系统」），无法换算；请先打开下单界面再重拾。")
         grid = ttk.Frame(self.body)
         grid.pack(fill="x")
         for idx, (name, label) in enumerate(COORD_FIELDS):
@@ -1439,6 +1865,8 @@ class CoordsEditor(BaseEditor):
             ttk.Entry(cell, textvariable=y_var, width=7).pack(side="left", padx=(2, 8))
             ttk.Button(cell, text="拾取", width=6,
                        command=lambda xv=x_var, yv=y_var, lb=label: self._pick(xv, yv, lb)).pack(side="left")
+            ttk.Button(cell, text="测试", width=6,
+                       command=lambda nm=name, lb=label: self._test_clicked(nm, lb)).pack(side="left", padx=(4, 0))
             self.rows[name] = (x_var, y_var)
         for name, val in coords.items():
             if name in self.rows:
@@ -1446,9 +1874,25 @@ class CoordsEditor(BaseEditor):
             x_var = tk.StringVar(value=str((val or [0, 0])[0]))
             y_var = tk.StringVar(value=str((val or [0, 0])[1]))
             self.rows[name] = (x_var, y_var)
-        ttk.Label(self.body, text="说明：点「拾取」后 3 秒内把鼠标移到同花顺对应控件上，到时自动读取当前鼠标位置；"
-                                  "也可按 main.py --detect 自动定位，或手工填写。全部为 [0,0] 时真实下单会被拒绝（dry_run 不受影响）。",
+        bar = ttk.Frame(self.body)
+        bar.pack(fill="x", pady=(10, 0))
+        ttk.Button(bar, text="测试全部输入框", width=16,
+                   command=self._test_inputs).pack(side="left")
+        self.fill_check = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            bar,
+            text="试填校验（默认关闭；勾选后写入一个数字，再用与真实下单相同的 Ctrl+A/Delete 清空）",
+            variable=self.fill_check,
+        ).pack(side="left", padx=(12, 0))
+        ttk.Label(bar, text="依次点击 6 个输入框并核对坐标/焦点（默认不输入字符）；不会点击买入/卖出按钮，也不会提交委托",
+                  style="Hint.TLabel").pack(side="left", padx=(8, 0))
+        ttk.Label(self.body, text="说明：点「拾取」后 3 秒内把鼠标移到同花顺对应控件上，到时自动读取并换算为"
+                                  "「下单窗口客户区相对坐标」（窗口移动/改分辨率后仍然有效）；也可按 main.py --detect 自动定位。"
+                                  "全部为 [0,0] 时真实下单会被拒绝（dry_run 不受影响）。" + notice,
                   style="Hint.TLabel", wraplength=980, justify="left").pack(fill="x", pady=(8, 0))
+        ttk.Label(self.body, text="说明：点「测试」会用当前填入的坐标真的点一次同花顺——输入框只点击并核对焦点与控件矩形，默认不输入字符（勾选「试填校验」才会写入），"
+                                  "按钮只把鼠标移过去不点击；状态栏会给出命中控件的矩形和同列输入框清单，据此判断是否要重拾。",
+                  style="Hint.TLabel", wraplength=980, justify="left").pack(fill="x", pady=(4, 0))
 
     def _pick(self, x_var: Any, y_var: Any, label: str) -> None:
         self.ui.status(f"3 秒后记录「{label}」的鼠标位置，请把鼠标移到目标控件上…")
@@ -1459,11 +1903,156 @@ class CoordsEditor(BaseEditor):
             except Exception as exc:  # noqa: BLE001
                 self.ui.status(f"读取鼠标位置失败：{exc}")
                 return
-            x_var.set(str(x))
-            y_var.set(str(y))
-            self.ui.status(f"已记录「{label}」= ({x}, {y})")
+            hwnd = _find_order_hwnd()
+            origin = _client_origin(hwnd)
+            if not origin:
+                self.ui.status("未找到同花顺下单窗口（标题需含「网上股票交易系统」），"
+                               "无法换算客户区相对坐标；本次未写入，请先打开下单界面后重拾")
+                return
+            rx, ry = int(x) - origin[0], int(y) - origin[1]
+            if rx < 0 or ry < 0:
+                self.ui.status(f"鼠标位置 ({x}, {y}) 落在下单窗口客户区之外，请把鼠标对准控件本体后重拾")
+                return
+            x_var.set(str(rx))
+            y_var.set(str(ry))
+            self.ui.status(f"已记录「{label}」= 客户区({rx}, {ry})  屏幕({x}, {y})")
 
         self.ui.root.after(3000, _grab)
+
+    # ---------- 坐标测试：按填入的坐标真的操作一次同花顺 ----------
+
+    def _resolve_point(self, name: str, label: str) -> Optional[Tuple[int, int, int, int, int]]:
+        """把该行客户区相对坐标换算成屏幕绝对坐标，返回 (rx, ry, sx, sy, hwnd)。"""
+        pair = self.rows.get(name)
+        if not pair:
+            self.ui.status(f"「{label}」没有对应的坐标行，无法测试", warn=True)
+            return None
+        try:
+            rx = int(str(pair[0].get()).strip() or 0)
+            ry = int(str(pair[1].get()).strip() or 0)
+        except Exception:  # noqa: BLE001
+            self.ui.status(f"「{label}」的 x/y 不是整数，无法测试", warn=True)
+            return None
+        if rx <= 0 and ry <= 0:
+            self.ui.status(f"「{label}」还没填坐标（当前 {rx}, {ry}），请先拾取", warn=True)
+            return None
+        hwnd = _find_order_hwnd()
+        origin = _client_origin(hwnd)
+        if not hwnd or not origin:
+            self.ui.status("未找到同花顺下单窗口（标题需含「网上股票交易系统」），无法测试；请先打开下单界面", warn=True)
+            return None
+        size = _client_size(hwnd)
+        if size and not (0 <= rx < size[0] and 0 <= ry < size[1]):
+            self.ui.status(f"「{label}」客户区坐标 ({rx}, {ry}) 超出客户区 {size[0]}x{size[1]}，该点不会命中控件", warn=True)
+            return None
+        return rx, ry, origin[0] + rx, origin[1] + ry, int(hwnd)
+
+    def _test_one(self, name: str, label: str) -> bool:
+        point = self._resolve_point(name, label)
+        if not point:
+            return False
+        rx, ry, sx, sy, hwnd = point
+        if not _activate_window(hwnd):
+            self.ui.status("无法把同花顺下单窗口切到最前面（可能被遮挡或权限不足），本次未测试", warn=True)
+            return False
+        time.sleep(0.2)
+        top = _win_root_at(sx, sy)
+        if top is not None and top != hwnd:
+            self.ui.status(f"「{label}」在屏幕 ({sx}, {sy}) 被其他窗口挡住，已跳过；请让下单界面完整显示后重试", warn=True)
+            return False
+        if name.endswith("_button"):
+            _move_cursor(sx, sy)
+            self.ui.status(f"「{label}」客户区({rx}, {ry}) → 屏幕({sx}, {sy})：鼠标已移到该点但未点击（避免误触发委托），请目视确认是否正好压住按钮", warn=True)
+            return True
+        child, cls = _probe_child_at(sx, sy)
+        if child is None:
+            self.ui.status(f"「{label}」客户区({rx}, {ry}) → 屏幕({sx}, {sy})：该坐标上没有可识别的控件，本次未点击；请重新拾取坐标", warn=True)
+            return False
+        focus = None
+        for _ in (1, 2):
+            _click_left(sx, sy)
+            time.sleep(0.18)
+            focus = _focus_hwnd(hwnd)
+            if _related_windows(focus, child):
+                break
+        if not _related_windows(focus, child):
+            self.ui.status(
+                f"「{label}」客户区({rx}, {ry}) → 屏幕({sx}, {sy})：点击后焦点没有落到该坐标上的控件"
+                f"（该点控件类 {cls or '未知'}，当前焦点在 {_window_class(focus) or '未知'}）；请重新拾取该坐标后重试",
+                warn=True,
+            )
+            return False
+        try_fill = bool(self.fill_check.get()) if getattr(self, "fill_check", None) is not None else False
+        if try_fill:
+            text = COORD_TEST_VALUES.get(name, "1")
+            _clear_field_hard()
+            time.sleep(0.05)
+            focus = _focus_hwnd(hwnd)
+            if not _related_windows(focus, child):
+                self.ui.status(
+                    f"「{label}」清空按键后焦点已从该控件漂移到 {_window_class(focus) or '未知'}，"
+                    f"已中止试填、一个数字都没有输入；请重新拾取坐标后重试", warn=True)
+                return False
+            _type_text(text)
+            time.sleep(0.3)
+            focus_written = _focus_hwnd(hwnd)
+            _clear_field_hard()
+            time.sleep(0.1)
+            drift = ""
+            if not _related_windows(focus_written, child):
+                drift = f"；注意：输入后焦点漂移到 {_window_class(focus_written) or '未知'}，数字可能落在别的框里，请目视核对"
+            self.ui.status(
+                f"「{label}」客户区({rx}, {ry}) → 屏幕({sx}, {sy})：已按「试填校验」向该控件输入 {text}，"
+                f"随后用与真实下单相同的清空序列（Ctrl+A → Delete → Backspace）清空，焦点全程未离开该控件{drift}。"
+                f"请目视确认输入时数字确实出现在这个框里", warn=True)
+            return True
+        rect = _client_rect(child, hwnd)
+        where = f"控件类 {cls or '未知'}"
+        if rect:
+            where += f"，客户区 ({rect[0]},{rect[1]})-({rect[2]},{rect[3]})，宽 {rect[2] - rect[0]} 高 {rect[3] - rect[1]}"
+        rows = _same_side_inputs(rect, hwnd)
+        hint = ""
+        if len(rows) > 1:
+            hint = "；同侧输入框自上而下：" + "、".join(
+                ("►" if h == int(child) else "") + f"y={y}(宽{w})" for y, w, h in rows
+            )
+        self.ui.status(
+            f"「{label}」客户区({rx}, {ry}) → 屏幕({sx}, {sy})：坐标已压准输入框，焦点已在该控件；{where}{hint}。"
+            f"本测试不向真实输入框输入任何字符（该控件不响应 WM_GETTEXT、读不回原值，所以默认只核对矩形），请按上面的矩形核对是否就是要填的那个框；如需验证能否真的输入，可勾选下方「试填校验」（写入后会按真实下单同样的 Ctrl+A → Delete 清空，清空效果已实测有效）"
+        )
+        return True
+
+    def _confirm(self, title: str, message: str) -> bool:
+        from tkinter import messagebox
+
+        return bool(messagebox.askokcancel(title, message))
+
+    def _test_clicked(self, name: str, label: str) -> None:
+        tip = ("按钮只把鼠标移过去、不点击（避免误触发下单）。" if name.endswith("_button")
+               else f"会点击该点并试填 {COORD_TEST_VALUES.get(name, '1')}，随后立即清空。")
+        if not self._confirm("坐标测试", "测试会把同花顺下单窗口切到最前面，再模拟真实鼠标操作：\n\n"
+                                        f"「{label}」{tip}\n\n测试期间请不要动鼠标键盘，全程不会提交任何委托。继续？"):
+            self.ui.status("已取消坐标测试")
+            return
+        self._test_one(name, label)
+
+    def _test_inputs(self) -> None:
+        names = [(n, lb) for n, lb in COORD_FIELDS if not n.endswith("_button")]
+        plan = "\n".join(f"· {lb}" for n, lb in names)
+        if not self._confirm("测试全部输入框坐标",
+                             "将把同花顺下单窗口切到最前面，按顺序点击下列输入框，逐个核对坐标是否压准、焦点是否到位"
+                             "（默认不输入任何字符，不会改动价格/数量/代码）：\n\n"
+                             f"{plan}\n\n不会点击买入/卖出按钮，也不会提交任何委托。测试期间请不要动鼠标键盘。继续？"):
+            self.ui.status("已取消坐标测试")
+            return
+        ok = 0
+        for name, label in names:
+            if not self._test_one(name, label):
+                self.ui.status(f"「{label}」测试未通过，已中断批量测试（修好该点后重试）", warn=True)
+                return
+            ok += 1
+            time.sleep(0.2)
+        self.ui.status(f"坐标测试完成：{ok}/{len(names)} 个输入框坐标均已压准并拿到焦点（未输入任何字符）")
 
     def apply(self, data: Dict[str, Any]) -> None:
         orig = self.ui.original.get("order_ui", {}).get("coords", {}) or {}
@@ -1478,7 +2067,21 @@ class CoordsEditor(BaseEditor):
         for name, val in orig.items():
             if name not in result:
                 result[name] = val
-        data.setdefault("order_ui", {})["coords"] = result
+        oui = data.setdefault("order_ui", {})
+        oui["coords"] = result
+        # 版本标记 + 参照尺寸：执行端据此判断坐标空间（client / 旧版 screen）与窗口尺寸是否变化。
+        # 关键约束：只有确实按客户区口径确定了这批值（旧格式已在打开时换算，或本次找到下单窗口）
+        # 才能打 client 标记；否则保留了旧版屏幕绝对坐标却标记成 client，会导致后续整体偏移。
+        size = _client_size(_find_order_hwnd())
+        legacy = str((self.ui.original.get("order_ui", {}) or {}).get("_coords_mode", "") or "").strip().lower() != "client"
+        prev_ref = (self.ui.original.get("order_ui", {}) or {}).get("_coords_ref")
+        if size:
+            oui["_coords_mode"] = "client"
+            oui["_coords_ref"] = {"client_w": size[0], "client_h": size[1]}
+        elif not legacy:
+            oui["_coords_mode"] = "client"
+            oui["_coords_ref"] = dict(prev_ref) if isinstance(prev_ref, dict) else {}
+        # legacy 且当前取不到下单窗口：保持原样（不打标记），执行端会临时换算并提示重拾
 
 
 # ======================================================================================
