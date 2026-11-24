@@ -9,6 +9,9 @@ config.json
 config.backup*.json
 config.json.bak_*
 
+# ---- 虚拟环境 ----
+.venv/
+
 # ---- 备份与编译产物 ----
 *.bak
 *.bak_*

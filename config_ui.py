@@ -6,7 +6,9 @@
 
 设计要点
 --------
-* 分组分页（Notebook）：账户与标的 / 行情 / 信号 / 交易 / 窗口 / 下单 UI / 坐标点 / 弹窗与日志 / 保留键。
+* 分组分页（Notebook）：新手指引 / 账户与标的 / 行情 / 信号 / 交易 / 窗口 / 下单 UI / 坐标点 / 弹窗与日志 / 保留键。
+* 新手指引：按「标的 → 坐标 → 检查保存」三步引导；标的可按代码自动从新浪行情补全名称/现价，
+  坐标可一键自动识别下单窗口 8 个操作点；所有结果写入既有编辑器，沿用统一的校验与备份保存流程。
 * 每个字段：中文标签 + 单位 + 原始 _help 说明（分组级 _help 显示在页首，字段级说明显示在字段下方）。
 * 输入校验：百分比、金额、股数（100 整数倍）、时刻 HH:MM、证券代码、屏幕坐标、URL 等；
   校验不通过不写盘，错误清单可点击定位到对应页签。
@@ -17,7 +19,7 @@
 
 命令行
 ------
-    python config_ui.py                 # 打开图形界面
+    python config_ui.py                 # 打开图形界面（首屏为「新手指引」页）
     python config_ui.py --config x.json # 编辑指定的配置文件
     python config_ui.py --check         # 只做校验，不打开窗口
     python config_ui.py --selftest      # 开发者自检：覆盖检查 + 校验器用例 + 结构保持验证
@@ -651,6 +653,9 @@ class ConfigUI:
         self.fields: Dict[Tuple[str, ...], "FieldRow"] = {}
         self.editors: List[Any] = []
         self.dirty = False
+        # 新手指引「自动识别」成功时记下当时的客户区尺寸，供 CoordsEditor.apply 打 client 标记。
+        # 这样即使识别后、保存前关闭了下单窗口，已写入的相对坐标也不会被误判为旧版绝对坐标。
+        self.guide_coords_ref: Optional[Dict[str, int]] = None
 
         self.root = tk.Tk()
         self.root.title(f"{APP_TITLE} —— {self.path.name}")
@@ -730,6 +735,9 @@ class ConfigUI:
         return "break"
 
     def _build_tabs(self) -> None:
+        guide_page = ScrollPage(self.nb)
+        self.nb.add(guide_page, text="新手指引")
+        self.guide = GuideEditor(self, guide_page.inner)
         for tab in SCHEMA:
             page = ScrollPage(self.nb)
             self.nb.add(page, text=tab.title)
@@ -760,6 +768,12 @@ class ConfigUI:
     def position_editor(self) -> Optional["PositionsEditor"]:
         for editor in self.editors:
             if isinstance(editor, PositionsEditor):
+                return editor
+        return None
+
+    def coords_editor(self) -> Optional["CoordsEditor"]:
+        for editor in self.editors:
+            if isinstance(editor, CoordsEditor):
                 return editor
         return None
 
@@ -913,21 +927,23 @@ class ConfigUI:
 
     def _jump_to_error(self, message: str) -> None:
         key = message.split(":", 1)[0].strip()
+        # 首屏是「新手指引」，SCHEMA 里的页签在 Notebook 中整体后移一位
+        offset = 1 if hasattr(self, "guide") else 0
         for idx, tab in enumerate(SCHEMA):
             if any(f.key == key for f in tab.fields):
-                self.nb.select(idx)
+                self.nb.select(idx + offset)
                 return
             if key.startswith("positions") and "positions" in tab.builders:
-                self.nb.select(idx)
+                self.nb.select(idx + offset)
                 return
             if key.startswith("price_decimals") and "decimals" in tab.builders:
-                self.nb.select(idx)
+                self.nb.select(idx + offset)
                 return
             if key.startswith("trade.sessions") and "sessions" in tab.builders:
-                self.nb.select(idx)
+                self.nb.select(idx + offset)
                 return
             if key.startswith("order_ui.coords") and "coords_page" in tab.builders:
-                self.nb.select(idx)
+                self.nb.select(idx + offset)
                 return
 
     # ---------------------------------------------------------------- 动作
@@ -1223,6 +1239,37 @@ class PositionsEditor(BaseEditor):
         if touched:
             self.ui.status(f"{code} 已从行情监控中移除")
 
+    def find_row(self, code: str) -> Optional[Dict[str, Any]]:
+        """按证券代码找已有行（新手指引导入时用于去重）。"""
+        code = str(code).strip()
+        for row in self.rows:
+            if str(row["code"].get()).strip() == code:
+                return row
+        return None
+
+    def upsert_from_guide(self, code: str, name: str, cost: Any, qty: Any, t0: bool) -> str:
+        """由新手指引新增或更新一条标的；返回 'added' / 'updated'。"""
+        row = self.find_row(code)
+        if row is None:
+            self._add_row(code, name, cost, qty, t0)
+            return "added"
+        # 已存在：只补空值，不覆盖用户已填的真实成本/数量/T+0
+        if not str(row["name"].get()).strip() and name:
+            row["name"].set(name)
+        try:
+            cost_val = float(cost)
+        except (TypeError, ValueError):
+            cost_val = 0.0
+        if float(str(row["cost"].get()).strip() or 0) == 0 and cost_val > 0:
+            row["cost"].set(fmt_cell(cost_val))
+        try:
+            qty_val = int(qty)
+        except (TypeError, ValueError):
+            qty_val = 0
+        if int(str(row["qty"].get()).strip() or 0) == 0 and qty_val > 0:
+            row["qty"].set(str(qty_val))
+        return "updated"
+
     def _add_row(self, code: Any, name: Any, cost: Any, qty: Any, t0: Any = None) -> None:
         tk, ttk = self.ui.tk, self.ui.ttk
         row = ttk.Frame(self.body)
@@ -1482,6 +1529,218 @@ def _client_size(hwnd: Optional[int]) -> Optional[Tuple[int, int]]:
         return int(rect.right - rect.left), int(rect.bottom - rect.top)
     except Exception:  # noqa: BLE001
         return None
+
+
+# ======================================================================================
+# 新手指引：行情自动补全 / 标的推断 / 下单坐标自动识别
+# 说明：只用标准库 + ctypes，不引入 requests，也不 import main.py，保持编辑器独立。
+# ======================================================================================
+
+FUND_CODE_PREFIXES = ("15", "16", "51", "56", "58")  # 与 main.py 一致：场内基金 / ETF 代码段
+
+
+def sina_symbol(code: str) -> str:
+    """6 位证券代码 → 新浪行情代码（6/9 沪市，其余深市）。"""
+    digits = re.sub(r"\D", "", str(code))[-6:]
+    if digits.startswith(("6", "9")):
+        return "sh" + digits
+    if digits.startswith(("5",)):
+        return "sh" + digits  # 51/56/58 沪市 ETF
+    return "sz" + digits
+
+
+def infer_t0(code: str) -> bool:
+    """按代码段推断是否当日可卖（T+0）：15/16/51/56/58 开头的场内基金/ETF。
+
+    注意：这是"按前缀推断"的粗略判断，与 main.py 的 is_fund_like 一致；
+    跨境/债券/黄金/货币 ETF 大多 T+0，股票 ETF 需按实际交易规则由使用者复核。
+    """
+    digits = re.sub(r"\D", "", str(code))[-6:]
+    return digits.startswith(FUND_CODE_PREFIXES)
+
+
+def fetch_quotes(codes: Sequence[str], timeout: float = 6.0) -> Tuple[Dict[str, Dict[str, Any]], str]:
+    """从新浪行情一次性拉取代码对应的名称/现价，返回 ({code: {...}}, 错误信息)。
+
+    使用标准库 urllib，返回 GB18030 解码的字段：0=名称 3=现价 2=昨收。
+    网络不可用时返回空字典与可读错误，调用方应保留手工录入能力。
+    """
+    codes = [re.sub(r"\D", "", str(c))[-6:] for c in codes if re.sub(r"\D", "", str(c))[-6:]]
+    codes = [c for c in codes if len(c) == 6]
+    if not codes:
+        return {}, "未提供有效的 6 位证券代码"
+    symbols = [sina_symbol(c) for c in codes]
+    url = "https://hq.sinajs.cn/list=" + ",".join(symbols)
+    try:
+        import urllib.request
+
+        req = urllib.request.Request(url, headers={
+            "Referer": "https://finance.sina.com.cn",
+            "User-Agent": "Mozilla/5.0",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("gb18030", "replace")
+    except Exception as exc:  # noqa: BLE001
+        return {}, f"行情请求失败：{type(exc).__name__}: {exc}"
+
+    quotes: Dict[str, Dict[str, Any]] = {}
+    for line in raw.splitlines():
+        m = re.match(r'\s*var hq_str_(\w+)\s*=\s*"([^"]*)"\s*;', line)
+        if not m:
+            continue
+        sym, payload = m.group(1), m.group(2)
+        fields = payload.split(",")
+        if len(fields) < 4 or not fields[0]:
+            continue
+        code = re.sub(r"\D", "", sym)[-6:]
+        try:
+            price = float(fields[3])
+        except (TypeError, ValueError):
+            price = 0.0
+        try:
+            prev = float(fields[2])
+        except (TypeError, ValueError):
+            prev = 0.0
+        quotes[code] = {"name": fields[0], "price": price, "prev": prev}
+    return quotes, ""
+
+
+def _enum_child_items(hwnd: int) -> List[Dict[str, Any]]:
+    """枚举窗口内所有子控件（类名/文本/屏幕矩形），与 main.py 的 _enum_child_items 一致。"""
+    items: List[Dict[str, Any]] = []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _cb(h: int, _p: Any) -> bool:  # noqa: ANN001
+            try:
+                cls_buf = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(wintypes.HWND(h), cls_buf, 256)
+                n = user32.GetWindowTextLengthW(wintypes.HWND(h))
+                txt_buf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(wintypes.HWND(h), txt_buf, n + 1)
+                rect = wintypes.RECT()
+                if not user32.GetWindowRect(wintypes.HWND(h), ctypes.byref(rect)):
+                    return True
+                l, t, r, b = int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+                if r - l <= 0 or b - t <= 0:
+                    return True
+                items.append({
+                    "cls": cls_buf.value or "", "text": txt_buf.value.strip(),
+                    "rect": (l, t, r, b), "cx": (l + r) // 2, "cy": (t + b) // 2,
+                    "w": r - l, "h": b - t,
+                })
+            except Exception:  # noqa: BLE001
+                return True
+            return True
+
+        user32.EnumChildWindows(wintypes.HWND(hwnd), _cb, 0)
+    except Exception:  # noqa: BLE001
+        pass
+    return items
+
+
+def detect_order_coords() -> Tuple[Dict[str, List[int]], List[str], str]:
+    """自动识别下单界面 8 个操作点（客户区相对坐标）。
+
+    算法与 main.py --detect 完全一致，返回 (coords, missing, detail)。
+    """
+    hwnd = _find_order_hwnd()
+    if not hwnd:
+        return {}, [], "未找到同花顺下单窗口：请先打开「网上股票交易系统」下单界面并保持可见"
+    items = _enum_child_items(hwnd)
+    if not items:
+        return {}, [], "下单窗口内未枚举到控件（可能被最小化）"
+    origin = _client_origin(hwnd)
+    if origin is None:
+        return {}, [], "下单窗口客户区原点读取失败（可能被最小化）"
+    ox, oy = origin
+
+    edits = [i for i in items if i["cls"] == "Edit" and i["w"] >= 20 and i["h"] >= 8]
+    by_text: Dict[str, Dict[str, Any]] = {}
+    for it in items:
+        if it["text"] and it["text"] not in by_text:
+            by_text[it["text"]] = it
+
+    def _edit_right_of(label_text: str) -> Optional[Dict[str, Any]]:
+        lb = by_text.get(label_text)
+        if not lb:
+            return None
+        cand = [
+            e for e in edits
+            if abs(e["cy"] - lb["cy"]) <= 14 and e["rect"][0] >= lb["rect"][2] - 10
+        ]
+        if not cand:
+            return None
+        cand.sort(key=lambda e: (abs(e["cy"] - lb["cy"]), e["rect"][0]))
+        return cand[0]
+
+    def _find_code_edit(title_kw: str, price_e: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        code_lb = None
+        for t, it in sorted(by_text.items(), key=lambda kv: kv[1]["rect"][0]):
+            if title_kw in t:
+                code_lb = it
+                break
+        if code_lb:
+            below = [
+                e for e in edits
+                if 0 <= (e["rect"][1] - code_lb["rect"][3]) < 45
+                and e["rect"][0] < code_lb["rect"][2] + 80
+                and e["rect"][2] > code_lb["rect"][0]
+            ]
+            if below:
+                return min(below, key=lambda e: e["rect"][1])
+        if price_e is not None:
+            ups = [
+                e for e in edits
+                if e["rect"][3] <= price_e["rect"][1]
+                and abs(e["rect"][0] - price_e["rect"][0]) < 25
+                and e["rect"][1] > price_e["rect"][1] - 120
+            ]
+            if ups:
+                return max(ups, key=lambda e: e["rect"][3])
+        return None
+
+    coords: Dict[str, List[int]] = {}
+    missing: List[str] = []
+
+    def _side(prefix: str, side_cn: str, title_kw: str, btn_kw: str,
+              btn_key: str, btn_label: str) -> None:
+        price_e = _edit_right_of(f"{side_cn}价格")
+        qty_e = _edit_right_of(f"{side_cn}数量")
+        code_e = _find_code_edit(title_kw, price_e)
+        for key, ent, label in (
+            (f"code_box{prefix}", code_e, "证券代码输入框"),
+            (f"price_box{prefix}", price_e, f"{side_cn}价格输入框"),
+            (f"qty_box{prefix}", qty_e, f"{side_cn}数量输入框"),
+        ):
+            if ent:
+                coords[key] = [ent["cx"] - ox, ent["cy"] - oy]
+            else:
+                missing.append(f"{key}({label})")
+        btns = [i for i in items if i["text"] == btn_kw and i["w"] >= 100]
+        if prefix:
+            btn = max(btns, key=lambda i: i["cx"]) if btns else None
+        else:
+            btn = min(btns, key=lambda i: (i["rect"][1], i["rect"][0])) if btns else None
+        if btn:
+            coords[btn_key] = [btn["cx"] - ox, btn["cy"] - oy]
+        else:
+            missing.append(f"{btn_key}({btn_label})")
+
+    _side("", "买入", "买入股票", "买入", "buy_button", "买入按钮")
+    _side("_sell", "卖出", "卖出股票", "卖出", "sell_button", "卖出按钮")
+
+    size = _client_size(hwnd)
+    size_text = f"{size[0]}x{size[1]}" if size else "未知"
+    detail = (
+        f"下单窗口 hwnd={hwnd}，控件 {len(items)} 个，编辑框 {len(edits)} 个；"
+        f"客户区原点(屏幕)=({ox},{oy})，尺寸={size_text}，均为客户区相对坐标"
+    )
+    return coords, missing, detail
 
 
 # ---------- 坐标测试：置前 / 遮挡判定 / 鼠标键盘模拟（仅 Windows） ----------
@@ -2073,6 +2332,10 @@ class CoordsEditor(BaseEditor):
         # 关键约束：只有确实按客户区口径确定了这批值（旧格式已在打开时换算，或本次找到下单窗口）
         # 才能打 client 标记；否则保留了旧版屏幕绝对坐标却标记成 client，会导致后续整体偏移。
         size = _client_size(_find_order_hwnd())
+        # 新手指引识别成功时已确认客户区口径，即使此刻窗口已关闭也要沿用当时的尺寸打标记
+        guide_ref = getattr(self.ui, "guide_coords_ref", None)
+        if guide_ref and isinstance(guide_ref, dict):
+            size = (int(guide_ref.get("client_w", 0)), int(guide_ref.get("client_h", 0))) or size
         legacy = str((self.ui.original.get("order_ui", {}) or {}).get("_coords_mode", "") or "").strip().lower() != "client"
         prev_ref = (self.ui.original.get("order_ui", {}) or {}).get("_coords_ref")
         if size:
@@ -2082,6 +2345,232 @@ class CoordsEditor(BaseEditor):
             oui["_coords_mode"] = "client"
             oui["_coords_ref"] = dict(prev_ref) if isinstance(prev_ref, dict) else {}
         # legacy 且当前取不到下单窗口：保持原样（不打标记），执行端会临时换算并提示重拾
+
+
+# ======================================================================================
+# 新手指引（三步向导）
+# ======================================================================================
+class GuideEditor:
+    """新手指引页：标的一键补全 → 坐标自动识别 → 检查与保存。
+
+    不直接持有配置数据：所有改动写入既有 PositionsEditor / CoordsEditor / FieldRow，
+    由 ConfigUI.collect() 统一校验，由 on_save() 统一备份 + 原子落盘。
+    """
+
+    def __init__(self, ui: ConfigUI, parent: Any) -> None:
+        tk, ttk = ui.tk, ui.ttk
+        self.ui = ui
+        self.frame = ttk.Frame(parent)
+        self.frame.pack(fill="both", expand=True, padx=14, pady=(8, 16))
+        self.query_results: Dict[str, Dict[str, Any]] = {}
+
+        ttk.Label(self.frame,
+                  text="按下面 3 步完成初始配置；所有改动会写入现有页签，最后统一点右下角「保存到配置文件」才生效。",
+                  style="Hint.TLabel", wraplength=1000, justify="left").pack(fill="x", pady=(0, 8))
+
+        # ---------------- 第 1 步：标的 ----------------
+        step1 = ttk.LabelFrame(self.frame, text="第 1 步  添加要做 T 的股票 / ETF 标的", padding=(10, 8))
+        step1.pack(fill="x", pady=(0, 10))
+        ttk.Label(step1, text="证券代码（6 位，多个用逗号分隔）",
+                  style="FieldLabel.TLabel").pack(anchor="w")
+        row = ttk.Frame(step1)
+        row.pack(fill="x", pady=(2, 4))
+        self.code_var = tk.StringVar(value="")
+        ttk.Entry(row, textvariable=self.code_var, width=48).pack(side="left", padx=(0, 8))
+        ttk.Button(row, text="① 查询行情并补全", width=18,
+                   command=self.on_query).pack(side="left", padx=(0, 6))
+        ttk.Button(row, text="跳过查询，直接按代码添加", width=22,
+                   command=self.on_add_offline).pack(side="left")
+        ttk.Label(step1, text="查询会联网从新浪行情获取证券名称与现价；网络不可用时可用「跳过查询」。"
+                              "成本默认填现价作占位，可卖股数默认 0，请到【账户与标的】页按真实持仓修改；"
+                              "标的会自动并入【行情】页监控列表。",
+                  style="Hint.TLabel", wraplength=990, justify="left").pack(anchor="w", pady=(2, 2))
+        self.step1_log = tk.Text(step1, height=6, wrap="word", font=("Consolas", 9))
+        self.step1_log.pack(fill="x", pady=(4, 0))
+
+        # ---------------- 第 2 步：坐标 ----------------
+        step2 = ttk.LabelFrame(self.frame, text="第 2 步  自动识别下单窗口坐标（8 个点）", padding=(10, 8))
+        step2.pack(fill="x", pady=(0, 10))
+        ttk.Label(step2, text="先打开同花顺「网上股票交易系统」下单界面（买入/卖出双面板），保持窗口可见且显示比例与平时一致，"
+                              "再点识别。识别只读取控件矩形，不会点击或输入任何内容。",
+                  style="Help.TLabel", wraplength=990, justify="left").pack(anchor="w")
+        row2 = ttk.Frame(step2)
+        row2.pack(fill="x", pady=(4, 4))
+        ttk.Button(row2, text="② 自动识别 8 个坐标", width=22,
+                   command=self.on_detect).pack(side="left", padx=(0, 8))
+        ttk.Button(row2, text="打开【坐标点】页核对", width=22,
+                   command=self.on_goto_coords).pack(side="left")
+        self.step2_log = tk.Text(step2, height=9, wrap="word", font=("Consolas", 9))
+        self.step2_log.pack(fill="x", pady=(4, 0))
+
+        # ---------------- 第 3 步：检查与保存 ----------------
+        step3 = ttk.LabelFrame(self.frame, text="第 3 步  检查并保存", padding=(10, 8))
+        step3.pack(fill="x")
+        row3 = ttk.Frame(step3)
+        row3.pack(fill="x", pady=(2, 6))
+        ttk.Button(row3, text="③ 检查配置", width=18,
+                   command=self.on_check).pack(side="left", padx=(0, 8))
+        ttk.Button(row3, text="立即保存到配置文件", width=22,
+                   command=self.ui.on_save).pack(side="left")
+        self.step3_log = tk.Text(step3, height=7, wrap="word", font=("Consolas", 9))
+        self.step3_log.pack(fill="x", pady=(4, 0))
+
+    # ---------------------------------------------------------------- 日志工具
+    @staticmethod
+    def _append(widget: Any, text: str) -> None:
+        try:
+            widget.insert("end", text + "\n")
+            widget.see("end")
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---------------------------------------------------------------- 第 1 步
+    def _input_codes(self) -> List[str]:
+        raw = str(self.code_var.get() or "")
+        parts = [p.strip() for p in re.split(r"[,，;；\s]+", raw) if p.strip()]
+        out: List[str] = []
+        for p in parts:
+            digits = re.sub(r"\D", "", p)[-6:]
+            if len(digits) == 6 and digits not in out:
+                out.append(digits)
+            elif p:
+                self._append(self.step1_log, f"  ✗ 跳过 {p}：不是 6 位证券代码")
+        return out
+
+    def on_query(self) -> None:
+        """联网查询代码 → 显示名称/现价 → 去重后导入持仓表。"""
+        codes = self._input_codes()
+        if not codes:
+            self._append(self.step1_log, "请先输入 6 位证券代码，多个用逗号分隔。")
+            return
+        self._append(self.step1_log, f"正在查询 {len(codes)} 个标的的行情…")
+        quotes, err = fetch_quotes(codes)
+        if err:
+            self._append(self.step1_log, f"  ⚠ {err}（可改用「跳过查询，直接按代码添加」）")
+        self.query_results = quotes
+        self._append(self.step1_log, "查询结果与导入情况：")
+        for code in codes:
+            q = quotes.get(code)
+            name = q["name"] if q else ""
+            price = q["price"] if q else 0
+            t0 = infer_t0(code)
+            status = self._import_one(code, name, price, t0)
+            self._append(self.step1_log,
+                         f"  ✔ {code}  {name or '（名称未获取）'}  现价 {price:.3f}  "
+                         f"T+0={'是' if t0 else '否'}（按代码段推断，请复核）→ {status}")
+        self.ui.status(f"已处理 {len(codes)} 个标的，请到【账户与标的】页核对成本与可卖股数")
+
+    def _import_one(self, code: str, name: str, price: float, t0: bool) -> str:
+        editor = self.ui.position_editor()
+        if editor is None:
+            return "未找到持仓编辑器"
+        status = editor.upsert_from_guide(code, name, fmt_cell(price) if price else 0, 0, t0)
+        if status == "added":
+            self.ui.sync_market_codes(added=[code])
+            self.ui.dirty = True
+        return "已新增" if status == "added" else "已存在，仅补全空项"
+
+    def on_add_offline(self) -> None:
+        """无网络时：只按代码推断 T+0 并导入，名称/成本留空待手填。"""
+        codes = self._input_codes()
+        if not codes:
+            self._append(self.step1_log, "请先输入 6 位证券代码。")
+            return
+        for code in codes:
+            status = self._import_one(code, "", 0, infer_t0(code))
+            self._append(self.step1_log,
+                         f"  ✔ {code} → {status}（T+0={'是' if infer_t0(code) else '否'}，请复核并补填名称/成本）")
+        self.ui.status(f"已按代码添加 {len(codes)} 个标的，记得补填名称与成本")
+
+    # ---------------------------------------------------------------- 第 2 步
+    def on_detect(self) -> None:
+        """调用自动识别，把 8 个坐标填入【坐标点】页。"""
+        self.step2_log.delete("1.0", "end")
+        self._append(self.step2_log, "正在识别下单窗口控件…")
+        self.ui.root.update_idletasks()
+        coords, missing, detail = detect_order_coords()
+        self._append(self.step2_log, detail)
+        if not coords:
+            self._append(self.step2_log, "  ✗ 未识别到任何坐标，请确认下单窗口已打开且未被最小化。")
+            self.ui.status("坐标自动识别失败：未找到窗口或控件", warn=True)
+            return
+        labels = {k: lb for k, lb in COORD_FIELDS}
+        for key, (cx, cy) in coords.items():
+            sx, sy = cx, cy
+            origin = _client_origin(_find_order_hwnd())
+            if origin:
+                sx, sy = cx + origin[0], cy + origin[1]
+            self._append(self.step2_log,
+                         f"  ✔ {labels.get(key, key):<16} {key:<14} 客户区[{cx},{cy}] 屏幕[{sx},{sy}]")
+        if missing:
+            self._append(self.step2_log, "  ⚠ 未识别：" + "、".join(missing) + "；缺失点请到【坐标点】页手动拾取。")
+        editor = self.ui.coords_editor()
+        if editor is None:
+            self._append(self.step2_log, "  ✗ 未找到坐标编辑器，无法写入。")
+            return
+        hwnd = _find_order_hwnd()
+        size = _client_size(hwnd) if hwnd else None
+        if size:
+            self.ui.guide_coords_ref = {"client_w": int(size[0]), "client_h": int(size[1])}
+        applied = 0
+        for key, (cx, cy) in coords.items():
+            pair = editor.rows.get(key)
+            if pair:
+                pair[0].set(str(cx))
+                pair[1].set(str(cy))
+                applied += 1
+        if applied:
+            self.ui.dirty = True
+        self._append(self.step2_log,
+                     f"\n已写入 {applied}/{len(COORD_FIELDS)} 个坐标到【坐标点】页；"
+                     f"{'缺少的点用「拾取」补齐后，' if missing else ''}请点「检查配置」确认。")
+        self.ui.status(f"已自动识别并写入 {applied} 个坐标，请核对后保存")
+
+    def on_goto_coords(self) -> None:
+        for idx in range(len(self.ui.nb.tabs())):
+            tab_id = self.ui.nb.tabs()[idx]
+            if self.ui.nb.tab(tab_id, "text") == "下单坐标":
+                self.ui.nb.select(idx)
+                self.ui.status("已切换到【坐标点】页，可逐项「拾取」或「测试」核对")
+                return
+        self.ui.status("未找到【坐标点】页签", warn=True)
+
+    # ---------------------------------------------------------------- 第 3 步
+    def on_check(self) -> None:
+        self.step3_log.delete("1.0", "end")
+        data, errors = self.ui.collect()
+        pos = self.ui.position_editor()
+        n_pos = len(pos.codes()) if pos else 0
+        self._append(self.step3_log, f"标的数量：{n_pos}；校验问题：{len(errors)}")
+        for item in errors[:8]:
+            self._append(self.step3_log, "  ✗ " + item)
+
+        editor = self.ui.coords_editor()
+        filled = 0
+        if editor:
+            for key, (xv, yv) in editor.rows.items():
+                try:
+                    if int(xv.get()) > 0 and int(yv.get()) > 0:
+                        filled += 1
+                except (TypeError, ValueError):
+                    pass
+        self._append(self.step3_log, f"坐标完整性：{filled}/{len(COORD_FIELDS)} 个已配置")
+        if filled < len(COORD_FIELDS):
+            self._append(self.step3_log, "  ⚠ 坐标未齐全：请用第 2 步自动识别，或到【坐标点】页手动拾取。")
+
+        dry = (data.get("order_ui") or {}).get("dry_run", None)
+        self._append(self.step3_log, f"演练模式 dry_run：{dry}（首次上线务必保持 true，确认无误后再关闭）")
+
+        diffs = diff_tree(self.ui.original, data)
+        self._append(self.step3_log, f"相对磁盘配置的改动：{len(diffs)} 处")
+        for path, old, new in diffs[:6]:
+            self._append(self.step3_log, f"  · {path}: {old!r} → {new!r}")
+        if not errors and n_pos > 0 and filled == len(COORD_FIELDS):
+            self._append(self.step3_log, "✔ 检查通过：点「立即保存到配置文件」，然后按 README 的顺序做 --once / --selftest 验证。")
+            self.ui.status("新手指引检查通过，请保存配置")
+        else:
+            self._append(self.step3_log, "✗ 尚有未完成项，按上面的提示处理后重新检查。")
+            self.ui.status("新手指引检查未通过，请查看第 3 步日志", warn=True)
 
 
 # ======================================================================================

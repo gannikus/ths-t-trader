@@ -1,0 +1,126 @@
+name: Release (portable + installer)
+
+# 推送到 main 即触发；也支持在 Actions 页手动点 Run workflow。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 创建 Release / 上传资产
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false   # 不取消已开始的构建，避免半截 Release
+
+jobs:
+  build:
+    name: Build Windows release
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0      # 取 short sha 用于版本号
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: packaging/requirements-build.txt
+
+      - name: Install build dependencies
+        run: python -m pip install --disable-pip-version-check -r packaging/requirements-build.txt
+
+      - name: Build portable EXE and zip
+        run: python packaging/build_release.py
+
+      - name: Verify EXE (read-only config check)
+        shell: pwsh
+        run: |
+          $manifest = Get-Content dist/release/manifest.json -Raw | ConvertFrom-Json
+          & $manifest.exe --ui --check --config (Join-Path $manifest.portable_dir 'config.json')
+          if ($LASTEXITCODE -ne 0) { throw "EXE 配置校验失败，退出码 $LASTEXITCODE" }
+
+      - name: Locate / install Inno Setup 6
+        shell: pwsh
+        run: |
+          function Find-ISCC {
+            $found = Get-Command ISCC.exe, ISCC -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { return $found.Source }
+            $roots = @('C:\Program Files (x86)\Inno Setup 6',
+                       'C:\Program Files\Inno Setup 6',
+                       'C:\Program Files (x86)\Inno Setup 5',
+                       'C:\Program Files\Inno Setup 5')
+            foreach ($r in $roots) {
+              $p = Join-Path $r 'ISCC.exe'
+              if (Test-Path $p) { return $p }
+            }
+            return $null
+          }
+          $iscc = Find-ISCC
+          if (-not $iscc) {
+            Write-Host 'Inno Setup 未预装，正在通过 Chocolatey 安装…'
+            choco install innosetup -y --no-progress
+            $env:Path = "$env:Path;C:\Program Files (x86)\Inno Setup 6"
+            $iscc = Find-ISCC
+          }
+          if (-not $iscc) { throw '无法定位 ISCC.exe，安装包构建中止' }
+          Write-Host "ISCC: $iscc"
+          "ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $manifest = Get-Content dist/release/manifest.json -Raw | ConvertFrom-Json
+          $outdir = Split-Path -Parent $manifest.exe
+          & $env:ISCC `
+            ("/DAppVersion=$($manifest.version)") `
+            ("/DSourceDir=$($manifest.portable_dir)") `
+            ("/DOutDir=$outdir") `
+            'packaging\installer.iss'
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup 编译失败，退出码 $LASTEXITCODE" }
+          if (-not (Test-Path $manifest.installer)) { throw "安装包未生成: $($manifest.installer)" }
+          Get-Item $manifest.installer | Select-Object Name, Length
+
+      - name: Expose release metadata
+        id: meta
+        shell: bash
+        run: |
+          echo "tag=$(python -c "import json;print(json.load(open('dist/release/manifest.json',encoding='utf-8'))['tag'])")" >> "$GITHUB_OUTPUT"
+          echo "version=$(python -c "import json;print(json.load(open('dist/release/manifest.json',encoding='utf-8'))['version'])")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+          path: |
+            dist/release/*.zip
+            dist/release/*-setup.exe
+            dist/release/manifest.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: THS-T-Assistant ${{ steps.meta.outputs.version }}
+          generate_release_notes: true
+          body: |
+            ## 下载
+            - **便携版**：`THS-T-Assistant-*-portable.zip`，解压即用，无需安装。
+            - **安装包**：`THS-T-Assistant-*-setup.exe`，安装到当前用户目录，无需管理员权限。
+
+            两个版本均内置**干净出厂配置**（示例标的 + 空坐标 + `dry_run=true`），
+            不会包含任何持仓成本或底仓数据。首次使用请在配置编辑器的「新手指引」页
+            完成标的与坐标配置，详见包内《使用说明.txt》。
+
+            本工具仅做行情提示与界面操作辅助，不构成投资建议。
+          files: |
+            dist/release/*.zip
+            dist/release/*-setup.exe
+          fail_on_unmatched_files: true

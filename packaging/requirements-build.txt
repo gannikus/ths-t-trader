@@ -1,0 +1,9 @@
+# 与运行依赖保持一致（见 README / start.bat）
+requests
+pyautogui
+pillow
+psutil
+pywin32
+
+# 打包工具
+pyinstaller>=6.0
