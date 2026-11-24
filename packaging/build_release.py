@@ -341,6 +341,34 @@ def make_zip(folder: Path, zip_path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# 打包后自检
+# ---------------------------------------------------------------------------
+def verify_exe(exe: Path, config_path: Path) -> None:
+    """用 --ui --check 做只读配置校验。
+
+    注意必须在 Python 里用 subprocess 等待 exe 退出：windowed exe 在 PowerShell 里
+    用 & 调用时 $LASTEXITCODE 为空、进程异步退出，会把「校验通过」误判成失败。
+    """
+    if not exe.exists() or exe.stat().st_size == 0:
+        return  # --skip-pyinstaller 调试模式，跳过自检
+    print("[INFO] 自检：exe --ui --check ...", flush=True)
+    try:
+        proc = subprocess.run(
+            [str(exe), "--ui", "--check", "--config", str(config_path)],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=120,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"exe 自检无法执行: {exc}") from exc
+    tail = (proc.stdout or "").strip().splitlines()
+    for line in tail[-3:]:
+        print(f"       {line}")
+    if proc.returncode != 0:
+        raise RuntimeError(f"exe 配置校验失败，退出码 {proc.returncode}")
+    print("[INFO] 自检通过：配置字段全部合法")
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 def main(argv: Optional[list] = None) -> int:
@@ -378,6 +406,9 @@ def main(argv: Optional[list] = None) -> int:
     portable_root = outdir / f"{EXE_NAME}-{version}-portable"
     write_portable(portable_root, exe, config, icon)
     zip_path = make_zip(portable_root, outdir / f"{EXE_NAME}-{version}-portable.zip")
+
+    # 打包后自检（失败则构建失败，不进入发布环节）
+    verify_exe(exe, portable_root / "config.json")
 
     manifest = {
         "version": version,

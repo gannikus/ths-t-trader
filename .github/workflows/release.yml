@@ -37,15 +37,8 @@ jobs:
       - name: Install build dependencies
         run: python -m pip install --disable-pip-version-check -r packaging/requirements-build.txt
 
-      - name: Build portable EXE and zip
+      - name: Build portable EXE and zip (with self-check)
         run: python packaging/build_release.py
-
-      - name: Verify EXE (read-only config check)
-        shell: pwsh
-        run: |
-          $manifest = Get-Content dist/release/manifest.json -Raw | ConvertFrom-Json
-          & $manifest.exe --ui --check --config (Join-Path $manifest.portable_dir 'config.json')
-          if ($LASTEXITCODE -ne 0) { throw "EXE 配置校验失败，退出码 $LASTEXITCODE" }
 
       - name: Locate / install Inno Setup 6
         shell: pwsh
