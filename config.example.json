@@ -1,0 +1,236 @@
+{
+  "market": {
+    "poll_interval_sec": 3,
+    "offhours_poll_interval_sec": 10,
+    "timeout_sec": 5,
+    "codes": [
+      "159325",
+      "159866"
+    ],
+    "sina_url": "https://hq.sinajs.cn/list={}",
+    "referer": "https://finance.sina.com.cn"
+  },
+  "positions": {
+    "_help": "键为 6 位证券代码；cost=持仓成本价（做T的盈亏基准），sellable_qty=底仓中当日可卖数量；t0=true 表示当日买入当日可卖。请替换为你自己的标的与数据。",
+    "510300": {
+      "name": "沪深300ETF",
+      "cost": 4.0,
+      "sellable_qty": 2000,
+      "t0": true
+    },
+    "159915": {
+      "name": "创业板ETF",
+      "cost": 2.0,
+      "sellable_qty": 2000,
+      "t0": true
+    }
+  },
+  "price_decimals": {
+    "_help": "价格小数位覆盖入口。键为 6 位证券代码，值为小数位（0-4）；default 留空(null) 表示全部按自动规则判断。自动规则：场内基金/ETF（代码 15/16/51/56/58 开头）或现价 < 10 元 → 3 位小数，最小报价单位 tick=0.001；其余 → 2 位小数，tick=0.01。用于控制台行情、--once 判定、信号弹窗、CSV 审计、下单价格框文本及 price_offset_ticks 的偏移计算。",
+    "default": null,
+    "_example": "\"600519\": 2, \"159325\": 3"
+  },
+  "trade": {
+    "_help": "buy_qty/sell_qty 为每次买卖股数（须为100的整数倍）；qty_mode=fixed 直接用上面股数，=notional 时按 min_notional 最低成交额反推手数（不低于 buy_qty/sell_qty），max_notional 为单笔成交额上限（0=不限）。低价ETF按100份下单时，1跳价差常常盖不住最低佣金，故默认 notional+5000元。max_pending_batches 为单标的允许同时存在的未平买入批次数，达到后不再触发正T买入（防止越跌越买变成加仓）。allow_stock_t_plus_1=false 时，股票（非ETF/基金）不产生正T信号，因为当日买入不可卖。book_on_dry_run=true 时演练也会推进批次台账，便于空跑观察完整买卖循环。cooldown_sec 为同标的同类型信号的冷却秒数；max_signals_per_day 为当日单标的单类型信号上限",
+    "buy_qty": 2000,
+    "sell_qty": 2000,
+    "qty_mode": "fixed",
+    "min_notional": 5000,
+    "max_notional": 0,
+    "max_pending_batches": 1,
+    "allow_stock_t_plus_1": false,
+    "book_on_dry_run": true,
+    "min_amplitude_pct": 1.5,
+    "_help_min_amplitude_pct": "当日振幅过滤（买卖两侧通用）：振幅=(最高-最低)/昨收，低于该值说明全天波动空间不足以覆盖双边成本，一律不出T信号。设 0 关闭。日经ETF这类低波品种建议 0.5~0.8，A股宽基 0.8~1.2",
+    "fees": {
+      "commission_rate_pct": 0.005,
+      "min_commission": 0.0,
+      "stamp_tax_pct": 0.0,
+      "transfer_fee_pct": 0.0,
+      "by_kind": {
+        "fund": {
+          "commission_rate_pct": 0.005,
+          "min_commission": 0.0,
+          "stamp_tax_pct": 0.0,
+          "transfer_fee_pct": 0.0
+        },
+        "stock": {
+          "commission_rate_pct": 0.005,
+          "min_commission": 5.0,
+          "stamp_tax_pct": 0.05,
+          "transfer_fee_pct": 0.001
+        }
+      },
+      "by_code": {}
+    },
+    "time_stop": {
+      "_help": "时间止损拆两层：时间层管「不留隔夜」——到 deadline 或持有超 max_hold_minutes 即强制平仓；价格层管「单笔亏损封顶」——浮亏达 loss_pct 才止损。两层各自独立开关，互不干扰。min_stop_distance=true 时止损距离自动抬到不小于止盈目标距离（max(target_ticks*tick, target_pct)），避免止盈没到止损先到；止损成交后进入 cooldown_after_stop_sec 冷静期，冷静期内不出新正T，期满后仍需价格低于止损价 reentry_gap_pct 才允许接回。",
+      "enabled": true,
+      "time_layer": {
+        "enabled": true,
+        "deadline": "14:50",
+        "max_hold_minutes": 120.0,
+        "trigger_on_deadline": true
+      },
+      "price_layer": {
+        "enabled": true,
+        "loss_pct": 0.8
+      },
+      "min_stop_distance": true,
+      "cooldown_after_stop_sec": 600,
+      "reentry_gap_pct": 0.5,
+      "_help_legacy": "旧的平铺字段 deadline/max_hold_minutes/loss_pct/trigger_on_deadline 已迁移到 time_layer/price_layer，代码仍兼容读取，请勿再在顶层维护。"
+    },
+    "sessions": [
+      [
+        "09:15",
+        "11:30"
+      ],
+      [
+        "13:00",
+        "15:05"
+      ]
+    ],
+    "cooldown_sec": 180,
+    "max_signals_per_day": 10,
+    "allow_offhours_signal": false,
+    "no_overnight": true,
+    "close_guard_minutes": 10,
+    "_help_no_overnight": "no_overnight=true 时：①收盘前 close_guard_minutes 分钟内不再产生新的正T买入信号（此时买入必然留到次日，违背当日闭环）；②时间层到点强制平仓，确保不留隔夜；③跨日仍有未平批次会在日志中告警并按隔夜持仓清理台账。",
+    "daily_loss_circuit": {
+      "_help": "日内亏损熔断：当日已实现盈亏（卖出价-买入批次成本-双边费用累计）为负且达到 max_loss_amount 元或相对底仓市值 max_loss_pct% 时，当日停止一切新开仓（正T/反T均不出信号），已持仓仍由时间止损平仓。两项同时生效、任一触发即熔断，0 表示该项不限制。",
+      "enabled": true,
+      "max_loss_amount": 0,
+      "max_loss_pct": 1.0
+    },
+    "dynamic_ticks": {
+      "enabled": true,
+      "k": 0.45,
+      "window_sec": 1800,
+      "hold_window_sec": 1200,
+      "min_ticks": 0,
+      "max_ticks": 0
+    },
+    "max_sell_per_day": 3
+  },
+  "signals": {
+    "_help": "正T=先买后卖（低吸摊低成本），反T=先卖后买（高位减仓低位接回）。阈值单位均为百分比；dev_ticks 为按最小变动价位计的跳数门槛（0=不看跳数），实际门槛取百分比与跳数中更严的一方，解决低价ETF百分比阈值不足一跳的问题。",
+    "buy_first": {
+      "_help": "below_avg_pct：现价低于分时均价线的比例；dev_ticks：低于均价线的跳数门槛（0.795 的 ETF 1跳=0.001≈0.13%，设 5 跳≈0.63%）；support_price 填 0 表示自动用 昨收*(1-support_break_pct%) 作为支撑；max_drop_pct：当日跌幅超过该值则不再低吸（防单边下跌）；check_cost=true 时买入价还须不高于 成本*(1+cost_tolerance_pct%)（正T低吸时通常关掉，否则跌下来就买不了）",
+      "enabled": true,
+      "below_avg_pct": 0.5,
+      "dev_ticks": 6,
+      "support_price": 0,
+      "support_break_pct": 3.0,
+      "max_drop_pct": 3.0,
+      "check_cost": false,
+      "cost_tolerance_pct": 1.0,
+      "rebuy_ticks": 4,
+      "_help_layer1": "第一层（零外部依赖）：①偏离分级——strong_dev_pct/strong_dev_ticks 为强档线，偏离超过强档视为错杀可免量能确认，介于原阈值与强档之间为弱档需量能确认；两者都设 0 则不分级（等同只按 dev_ticks/below_avg_pct 判定）。②量能确认——volume_confirm=off 关闭 / weak 仅弱档要求 / always 全部要求；volume_dir=surge 要求放量（有承接）或 shrink 要求缩量（卖压衰竭）；volume_window_sec 为短期观察窗，volume_baseline_sec 为其之前的对照窗，volume_ratio 为短期速率/对照速率的倍数门槛。样本不足（刚开盘或刚重启）时本项自动跳过。",
+      "strong_dev_pct": 1.0,
+      "strong_dev_ticks": 10,
+      "volume_confirm": "weak",
+      "volume_dir": "surge",
+      "volume_window_sec": 60,
+      "volume_baseline_sec": 300,
+      "volume_ratio": 1.2
+    },
+    "sell_first": {
+      "_help": "卖出基准不再默认用历史成本：basis=batch 用当日未平买入批次加权成本（真正的平T，推荐），basis=day_avg 用当日分时均价，basis=cost 才用历史持仓成本。above_avg_pct/dev_ticks：高于分时均价线的门槛。target_ticks/target_pct：相对基准至少要走出的跳数/百分比（地板价的底线），实际地板价再叠加双边佣金摊薄后向上取整。require_cost_profit=true 时额外要求现价高于 成本*(1+min_profit_over_cost_pct%)。趋势过滤（防止卖飞）：trend_guard=off/cap/slope/both，both 为默认；trend_cap_ticks=现价高于均价线的跳数上限，超过视为加速拉升段，不卖；trend_slope_ticks/trend_window_sec=近该秒数内均价线抬升的跳数上限，超过说明买盘持续占优，不卖。样本不足（刚开盘/刚重启）自动跳过。【斜率阈值标定】trend_slope_ticks 是绝对跳数，必须按标的波动率标定：ETF 的 VWAP 十分钟内动 1-2 跳已属强势上行，设 3 跳等于永不触发（2026-11-23 实测全天最大斜率 +2.17 跳，拦截率 0%）。实测标定：159325 用 1.0 跳（拦 18% 候选时点），159866 用 0.5 跳（该标的 p90 仅 +0.41 跳，1 跳同样失效）。量能确认（卖出侧）：volume_confirm=always/off，要求卖出时必须有真实换手；volume_dir=surge 要求近 volume_window_sec 的每秒成交量 ÷ 前 volume_baseline_sec 均速 ≥ volume_ratio 才卖（防无量虚涨的高卖陷阱），volume_dir=shrink 为反向口径（缩量才卖，认为放量强趋势易卖飞）。样本不足自动跳过。",
+      "enabled": true,
+      "basis": "batch",
+      "above_avg_pct": 0.3,
+      "dev_ticks": 6,
+      "target_ticks": 6,
+      "target_pct": 0.5,
+      "require_cost_profit": false,
+      "min_profit_over_cost_pct": 0.5,
+      "trend_guard": "both",
+      "trend_cap_ticks": 8,
+      "trend_slope_ticks": 1,
+      "trend_window_sec": 600,
+      "volume_confirm": "always",
+      "volume_window_sec": 300,
+      "volume_baseline_sec": 300,
+      "volume_ratio": 0.8,
+      "volume_dir": "surge",
+      "require_atr_feasible": true,
+      "atr_feasible_ratio": 1.5,
+      "max_sell_per_day": 3
+    }
+  },
+  "window": {
+    "_help": "同花顺远航版进程与主窗口监控；窗口缺失只提示，不中断行情监控",
+    "process_name": "happ.exe",
+    "process_exe": "C:\\\\Program Files\\\\THS\\\\bin\\\\happ.exe",
+    "title_keywords": [
+      "同花顺",
+      "远航版"
+    ],
+    "require_foreground": false
+  },
+  "order_ui": {
+    "_help": "下单界面坐标与输入方式。【坐标获取方法】方式一（推荐）：python main.py --detect --write，自动读取下单窗口控件矩形写入买卖两侧共 8 个坐标（左侧 code_box/price_box/qty_box/buy_button，右侧 code_box_sell/price_box_sell/qty_box_sell/sell_button），全程不需按键。方式二：python main.py --pick --manual，鼠标悬停控件静止约 1.5 秒自动记录，ESC 结束并写回本文件（F1/F2/F8 已被同花顺注册为功能热键，不可用于拾取）。方式三：在另一个 Python 窗口执行 import pyautogui; pyautogui.displayMousePosition()，鼠标悬停控件时读取屏幕坐标手填。坐标是【屏幕绝对坐标，单位像素】，格式 [x, y]；[0,0] 或负数表示未配置，真实下单时会拒绝执行（dry_run 仍可演练）。locate_at_runtime=true 时，真实下单前会按控件重新实时定位并覆盖本文件的静态坐标，窗口被拖动/换分辨率后无需重新拾取；定位失败才回退静态坐标。 【下单弹窗】点「买入/卖出」按钮后同花顺会弹「委托确认」框，再弹「提示」框返回合同编号。auto_confirm_order=true 时脚本会读取确认框回显的代码/价格/数量，与预期一致才点「是」，不一致点「否」并中止（ORDER_ABORTED_MISMATCH），随后读取提示框里的合同编号写入日志；设为 false 则一律点「否」，只核对回显不提交。dialog_timeout_sec 为等待弹窗出现的秒数。",
+    "dry_run": true,
+    "bring_to_front": true,
+    "dpi_aware": true,
+    "action_delay_ms": 350,
+    "type_interval_sec": 0.03,
+    "qty_unit": "shares",
+    "price_mode": "signal",
+    "price_offset_ticks": 0,
+    "screenshot": true,
+    "coords": {
+      "code_box": [
+        386,
+        695
+      ],
+      "price_box": [
+        376,
+        749
+      ],
+      "qty_box": [
+        376,
+        826
+      ],
+      "buy_button": [
+        353,
+        862
+      ],
+      "sell_button": [
+        830,
+        862
+      ],
+      "code_box_sell": [
+        862,
+        695
+      ],
+      "price_box_sell": [
+        852,
+        749
+      ],
+      "qty_box_sell": [
+        852,
+        826
+      ]
+    },
+    "locate_at_runtime": true,
+    "auto_confirm_order": true,
+    "dialog_timeout_sec": 5.0
+  },
+  "ui": {
+    "_help": "popup_timeout_sec：确认弹窗倒计时秒数，超时自动放弃；sound：是否播放提示音",
+    "popup_timeout_sec": 10,
+    "sound": true,
+    "always_on_top": true,
+    "show_dashboard": true
+  },
+  "logging": {
+    "_help": "log_dir 留空或填相对路径（如 logs）时，统一落到 %LOCALAPPDATA%\\ths_t_trader\\logs；填绝对路径则原样使用。运行日志、审计 CSV、下单截图、状态台账都写在该目录。",
+    "log_dir": "logs",
+    "csv_encoding": "utf-8-sig",
+    "audit_filename": "audit_trade.csv",
+    "runtime_filename": "runtime.log"
+  },
+  "position_overrides": {}
+}

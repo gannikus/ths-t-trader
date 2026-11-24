@@ -1,0 +1,28 @@
+# ---- 运行时数据（本地生成，不入库）----
+logs/
+data/
+backups/
+*.log
+
+# ---- 真实配置：含持仓成本与底仓数量，禁止入库 ----
+config.json
+config.backup*.json
+config.json.bak_*
+
+# ---- 备份与编译产物 ----
+*.bak
+*.bak_*
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+
+# ---- 截图与大二进制 ----
+*.png
+*.exe
+*.zip
+
+# ---- 系统 ----
+Thumbs.db
+desktop.ini
