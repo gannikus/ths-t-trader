@@ -9,16 +9,6 @@ AIGC:
     ReservedCode2: VOBeHRJfFsj7iChzRvNwERAOQoFQJwLXyL/Wb6/aAcGTMJ/h9X7rU4zsGn0d+F6m/NBCKVv3Xd1uThgoGLTBCb3zkNBYwwBHKIzV56faurlEaSSPSGVU35Ki2oSaUgxtvtRMl2B4zDecLMl6mfS68NpqPJ/LwJ5FuVpI68T/5IXpJ+8O8pEU9ujSlkw=
 ---
 
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: 2cf0af362bda02c9ebee3360cad8ea10_fda67b45e33911f1913b525400393706
-    ReservedCode1: DD4NoQuXaa8HlD2iBNf4TpMwZWlEU4haMjOEEzD2EUN8y4VQteKn0m7qJdsjvhPoG61ClWiik4dzI8OpOdRddenLjhtBijvJS3laFF/GbGolJjNpKJB7oECVuDmG+rDaNVn5DyTs5dt+01ddexEn6fhEMRWQpjDpVKA0W/NpRcK2bF5zUyfVBPuEoUE=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: 2cf0af362bda02c9ebee3360cad8ea10_fda67b45e33911f1913b525400393706
-    ReservedCode2: DD4NoQuXaa8HlD2iBNf4TpMwZWlEU4haMjOEEzD2EUN8y4VQteKn0m7qJdsjvhPoG61ClWiik4dzI8OpOdRddenLjhtBijvJS3laFF/GbGolJjNpKJB7oECVuDmG+rDaNVn5DyTs5dt+01ddexEn6fhEMRWQpjDpVKA0W/NpRcK2bF5zUyfVBPuEoUE=
----
 
 # 同花顺做T半自动辅助工具（THS-T-Assistant v1.0.0）
 
