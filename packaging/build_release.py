@@ -138,14 +138,25 @@ def build_factory_config() -> Dict[str, Any]:
     # config_ui 校验器要求至少一只标的；示例用公开指数 ETF 与中性数值，
     # 用户必须在「新手指引」页替换成自己的真实标的与成本。
     DEMO_CODE = "510300"
-    cfg["positions"] = {
-        DEMO_CODE: {
-            "name": "沪深300ETF（示例，请替换）",
-            "cost": 4.0,
-            "sellable_qty": 100,
-            "t0": True,
-        },
-    }
+    # positions._help 是分组级说明文本，配置编辑器构建 GUI 时必须读取。
+    # 清洗持仓时若一并删掉，exe --ui 会抛「配置缺少键：positions._help」并秒退，
+    # 主程序随后误报「config.json 未修改」。务必保留（文本里的代码由下方 walk 泛化）。
+    positions_help = str((cfg.get("positions") or {}).get("_help", ""))
+
+    def demo_positions() -> Dict[str, Any]:
+        positions: Dict[str, Any] = {
+            DEMO_CODE: {
+                "name": "沪深300ETF（示例，请替换）",
+                "cost": 4.0,
+                "sellable_qty": 100,
+                "t0": True,
+            },
+        }
+        if positions_help:
+            positions["_help"] = positions_help
+        return positions
+
+    cfg["positions"] = demo_positions()
     cfg["position_overrides"] = {}
     cfg.setdefault("market", {})["codes"] = [DEMO_CODE]
 
@@ -191,14 +202,7 @@ def build_factory_config() -> Dict[str, Any]:
     cfg = merge(extract_default_config(), cfg)
     # 合并后再次强制：DEFAULT_CONFIG 里的 600519 示例持仓不能混进出厂包，
     # 只保留上面设定的 DEMO_CODE 演示标的。
-    cfg["positions"] = {
-        DEMO_CODE: {
-            "name": "沪深300ETF（示例，请替换）",
-            "cost": 4.0,
-            "sellable_qty": 100,
-            "t0": True,
-        },
-    }
+    cfg["positions"] = demo_positions()
     cfg["position_overrides"] = {}
     cfg["market"]["codes"] = [DEMO_CODE]
     cfg["order_ui"]["dry_run"] = True
@@ -344,28 +348,34 @@ def make_zip(folder: Path, zip_path: Path) -> Path:
 # 打包后自检
 # ---------------------------------------------------------------------------
 def verify_exe(exe: Path, config_path: Path) -> None:
-    """用 --ui --check 做只读配置校验。
+    """只读自检：--check 校验数据字段，--gui-smoke 真正构建全部 GUI 界面。
 
-    注意必须在 Python 里用 subprocess 等待 exe 退出：windowed exe 在 PowerShell 里
+    --check 只检查 SCHEMA 映射的字段，不会读取分组说明文本（如 positions._help）。
+    只跑 --check 会漏掉「配置缺少键：positions._help」这类只有打开配置窗口才暴露的
+    问题——现象是配置编辑器秒退、主程序误报「config.json 未修改」。所以两项都要跑。
+
+    注意必须在 Python 里用 subprocess 等待 exe 退出：windowed exe 在 shell 里
     用 & 调用时 $LASTEXITCODE 为空、进程异步退出，会把「校验通过」误判成失败。
     """
     if not exe.exists() or exe.stat().st_size == 0:
         return  # --skip-pyinstaller 调试模式，跳过自检
-    print("[INFO] 自检：exe --ui --check ...", flush=True)
-    try:
-        proc = subprocess.run(
-            [str(exe), "--ui", "--check", "--config", str(config_path)],
-            capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=120,
-        )
-    except Exception as exc:
-        raise RuntimeError(f"exe 自检无法执行: {exc}") from exc
-    tail = (proc.stdout or "").strip().splitlines()
-    for line in tail[-3:]:
-        print(f"       {line}")
-    if proc.returncode != 0:
-        raise RuntimeError(f"exe 配置校验失败，退出码 {proc.returncode}")
-    print("[INFO] 自检通过：配置字段全部合法")
+    for flag, label in (("--check", "配置字段校验"), ("--gui-smoke", "GUI 界面构建")):
+        print(f"[INFO] 自检：exe --ui {flag}（{label}）...", flush=True)
+        try:
+            proc = subprocess.run(
+                [str(exe), "--ui", flag, "--config", str(config_path)],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=120,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"exe 自检无法执行（{flag}）: {exc}") from exc
+        tail = (proc.stdout or "").strip().splitlines()
+        for line in tail[-3:]:
+            print(f"       {line}")
+        if proc.returncode != 0:
+            detail = " | ".join(tail[-3:])
+            raise RuntimeError(f"exe {label}失败，退出码 {proc.returncode}: {detail}")
+    print("[INFO] 自检通过：配置字段合法 + GUI 可正常构建")
 
 
 # ---------------------------------------------------------------------------
