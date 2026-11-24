@@ -49,7 +49,8 @@ DisableProgramGroupPage=yes
 LicenseFile=
 
 [Languages]
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+; Chocolatey 版 Inno Setup 6.7.1（非商业版）不含 ChineseSimplified.isl，
+; 只用内置 Default.isl，避免 CI 编译失败。安装内容本身仍为中文。
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]

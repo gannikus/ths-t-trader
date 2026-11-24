@@ -423,7 +423,7 @@ ths_t_trader/
 
 1. 打包单文件 `THS-T-Assistant.exe`（`--ui` 参数复用为图形化配置编辑器）；
 2. 生成**便携版** `THS-T-Assistant-<版本>-portable.zip`（exe + 干净出厂配置 + 使用说明 + 文档）；
-3. 用 Inno Setup 生成**安装包** `THS-T-Assistant-<版本>-setup.exe`（装到当前用户目录，无需管理员权限，带开始菜单/配置编辑器快捷方式）；
+3. 用 Inno Setup 生成**安装包** `THS-T-Assistant-<版本>-setup.exe`（装到当前用户目录，无需管理员权限，带开始菜单/配置编辑器快捷方式；安装向导界面为英文，安装内容与快捷方式为中文）；
 4. 创建 GitHub Release，上传上述两个文件，版本号形如 `v1.0.0-20261124-<short-sha>`。
 
 **出厂配置安全设计**：包内 `config.json` 以字段完整配置为结构基线，但彻底清洗了隐私数据——
