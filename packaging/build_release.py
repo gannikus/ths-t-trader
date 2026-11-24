@@ -37,6 +37,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+# 英文版 Windows（如 GitHub Actions runner）默认 stdout 是 cp1252，
+# 直接 print 中文会抛 UnicodeEncodeError。强制切到 UTF-8，脚本自包含。
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTDIR = ROOT / "dist" / "release"
 EXE_NAME = "THS-T-Assistant"
