@@ -165,6 +165,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "cooldown_sec": 300,
         "max_signals_per_day": 6,
         "allow_offhours_signal": False,
+        # 收盘前强制回补：反T 卖出后到点仍未回买，则无条件补回（豁免价格线/跌幅/冷静期/熔断），
+        # 否则这笔敞口跨日结转成底仓缺口，可卖数量被永久扣减直到人工补回
+        "rebuy_force": {"enabled": False, "deadline": "14:45"},
+        # 底仓保留线：可卖余量扣掉该股数后仍需够一次反T卖出才允许新开反T，防止底仓被卖空
+        "min_sellable_reserve": 0,
     },
     "signals": {
         "buy_first": {
@@ -725,6 +730,7 @@ class Batch:
     opened_at: float            # 建仓时间戳
     signal_id: str = ""
     fee: float = 0.0            # 该批次买入佣金（按剩余量等比分摊）
+    sellable_from: str = ""     # 可卖起始日（ISO）：T+1 当日买入填次一交易日，空=不限
 
     @property
     def cost_price(self) -> float:
@@ -754,16 +760,40 @@ class BatchBook:
         today = date.today().isoformat()
         if self._day != today:
             self._day = today
-            self._batches.clear()
+            # T+1 标的当日买入的批次当天不可卖，次日才可卖：直接清空会让正T买入永远等不到
+            # 可卖日，只能变成隔夜加仓。所以跨日只保留「已到期可卖」的批次，其余按异常清理。
+            self.carry_over(today)
+
+    def carry_over(self, day: str) -> Dict[str, int]:
+        """跨日保留「可卖起始日已到」的批次，返回被清理掉的不可卖股数（供告警）。"""
+        dropped: Dict[str, int] = {}
+        for code, bs in list(self._batches.items()):
+            keep: List[Batch] = []
+            drop = 0.0
+            for b in bs:
+                if b.qty <= 0:
+                    continue
+                if b.sellable_from and b.sellable_from <= day:
+                    keep.append(b)
+                else:
+                    drop += float(b.qty)
+            if drop > 0:
+                dropped[code] = int(drop)
+            if keep:
+                self._batches[code] = keep
+            else:
+                self._batches.pop(code, None)
+        return dropped
 
     def reset(self) -> None:
         self._batches.clear()
 
     def add(self, code: str, price: float, qty: float, fee: float = 0.0,
-            signal_id: str = "") -> Batch:
+            signal_id: str = "", sellable_from: str = "") -> Batch:
         self._roll()
         b = Batch(code=short_code(code), price=float(price), qty=float(qty),
-                  opened_at=time.time(), signal_id=signal_id, fee=float(fee))
+                  opened_at=time.time(), signal_id=signal_id, fee=float(fee),
+                  sellable_from=sellable_from)
         self._batches.setdefault(b.code, []).append(b)
         return b
 
@@ -790,8 +820,19 @@ class BatchBook:
         b = self.oldest(code)
         return 0.0 if b is None else max(0.0, (time.time() - b.opened_at) / 60.0)
 
-    def consume(self, code: str, qty: float) -> List[Batch]:
-        """FIFO 扣减批次，返回被本次卖出平掉的份额。"""
+    def sellable_pending(self, code: str, day: str = "") -> List[Batch]:
+        """待平批次中「可卖起始日 ≤ day」的部分（T+1 当日买入的新仓不在其中）。"""
+        bs = self.pending(code)
+        if not day:
+            return bs
+        return [b for b in bs if (not b.sellable_from) or b.sellable_from <= day]
+
+    def consume(self, code: str, qty: float, day: str = "") -> List[Batch]:
+        """FIFO 扣减批次，返回被本次卖出平掉的份额。
+
+        day 非空时只核销「可卖起始日已到」的批次：T+1 标的当日买入的份额当日不可卖，
+        卖出只能核销底仓或更早批次，否则会把不可卖的新仓记成「已卖出平T」。
+        """
         self._roll()
         left = float(qty)
         used: List[Batch] = []
@@ -799,6 +840,8 @@ class BatchBook:
             if left <= 0:
                 break
             if b.qty <= 0:
+                continue
+            if day and b.sellable_from and b.sellable_from > day:
                 continue
             take = min(b.qty, left)
             b.qty -= take
@@ -808,7 +851,8 @@ class BatchBook:
             else:
                 b.fee = b.fee * (b.qty / (b.qty + take))
             used.append(Batch(code=b.code, price=b.price, qty=take,
-                              opened_at=b.opened_at, signal_id=b.signal_id))
+                              opened_at=b.opened_at, signal_id=b.signal_id,
+                              sellable_from=b.sellable_from))
         return used
 
     def snapshot(self, code: str = "") -> str:
@@ -906,6 +950,7 @@ class SignalEngine:
         self._last_sell: Dict[str, Dict[str, Any]] = {}  # 标的 -> 上一笔反T卖出水位（price/at/closed_price）
         self._sold_today: Dict[str, float] = {}      # 标的 -> 当日已卖出股数（底仓余量递减，回买时释放）
         self._net_pos: Dict[str, float] = {}         # 标的 -> 当日净持仓变化（买+卖-，用于暴露底仓缺口）
+        self._base_gap: Dict[str, float] = {}   # 标的 -> 累计底仓缺口股数（跨日未回买结转，卖出前先从这里扣）
         self._vol: Dict[str, List[Tuple[float, float]]] = {}  # 标的 -> [(时间戳, 累计成交量)] 量能采样
         self._avg: Dict[str, List[Tuple[float, float]]] = {}  # 标的 -> [(时间戳, 分时均价)] 趋势采样
         self._px: Dict[str, List[Tuple[float, float]]] = {}   # 标的 -> [(时间戳, 现价)] 波动率采样
@@ -1016,6 +1061,13 @@ class SignalEngine:
     def _signal_conf(self, keywords: str, code: str) -> Dict[str, Any]:
         """取 signals.<keywords> 并按标的覆盖（position_overrides.<code>.signals）。"""
         base: Dict[str, Any] = dict(self.cfg["signals"].get(keywords) or {})
+        if keywords == "rebuy":
+            # 回买通道独立配置：未配置时缺省启用（反T卖出后必须能买回），
+            # rebuy_ticks 允许与 signals.buy_first 共用，避免老配置失效。
+            base.setdefault("enabled", True)
+            _bf = self.cfg["signals"].get("buy_first") or {}
+            if "rebuy_ticks" not in base and "rebuy_ticks" in _bf:
+                base["rebuy_ticks"] = _bf["rebuy_ticks"]
         ovs = self.cfg.get("position_overrides")
         if isinstance(ovs, dict) and code:
             ov = ovs.get(short_code(code)) or ovs.get(code) or {}
@@ -1157,14 +1209,15 @@ class SignalEngine:
             book: Dict[str, List[Dict[str, Any]]] = {}
             for code, bs in self.book._batches.items():
                 items = [{"price": b.price, "qty": b.qty, "opened_at": b.opened_at,
-                          "signal_id": b.signal_id, "fee": b.fee}
+                          "signal_id": b.signal_id, "fee": b.fee,
+                         "sellable_from": b.sellable_from}
                          for b in bs if b.qty > 0]
                 if items:
                     book[short_code(code)] = items
             data = {
                 "day": date.today().isoformat(),
                 "book": book,
-                "rebuy": self._rebuy,
+                "rebuy": self._rebuy, "base_gap": self._base_gap,
                 "last_sell": self._last_sell,
                 "sold_today": self._sold_today,
                 "net_pos": self._net_pos,
@@ -1193,6 +1246,14 @@ class SignalEngine:
         except Exception:
             return
         today = date.today().isoformat()
+        # 底仓缺口是跨日概念：状态文件即使是上一个交易日的也必须把缺口捡回来，
+        # 否则重启一次就等同于「缺口凭空消失」，可卖数量被虚增，后续必然超卖。
+        try:
+            self._base_gap = {short_code(k): float(v)
+                              for k, v in (data.get("base_gap") or {}).items()
+                              if float(v or 0) > 0}
+        except Exception:
+            self._base_gap = {}
         if str(data.get("day", "")) != today:
             return
         self._day = today
@@ -1206,7 +1267,8 @@ class SignalEngine:
                     b = Batch(code=short_code(code), price=float(it["price"]), qty=qty,
                               opened_at=float(it.get("opened_at") or time.time()),
                               signal_id=str(it.get("signal_id") or ""),
-                              fee=float(it.get("fee") or 0.0))
+                              fee=float(it.get("fee") or 0.0),
+                              sellable_from=str(it.get("sellable_from") or ""))
                 except Exception:
                     continue
                 self.book._batches.setdefault(b.code, []).append(b)
@@ -1235,20 +1297,63 @@ class SignalEngine:
     def _roll_day(self) -> None:
         today = date.today().isoformat()
         if self._day != today:
-            # 不留隔夜：跨日仍有未平批次说明昨日收盘前没平掉，属于异常，必须告警后再按隔夜持仓清理，
-            # 否则昨日批次会被当成今日待平批次，用今天的新底仓去核算昨天的价格。
-            leak = {c: int(sum(b.qty for b in v)) for c, v in self.book._batches.items()
-                    if v and sum(b.qty for b in v) > 0}
+            # 不留隔夜：跨日仍有「不可卖」批次说明昨日没处理干净，属于异常，必须告警后再清理；
+            # 但 T+1 标的「昨日买入、今日已到可卖日」的批次是正常持仓，必须保留，否则正T无法卖出。
+            leak = self.book.carry_over(today)
             if leak:
                 logging.getLogger("t_trader").warning(
-                    "跨日残留未平批次 %s：上一个交易日收盘前未平仓，已按隔夜持仓处理并清空T台账"
-                    "（该仓位已转为底仓，不计入今日做T）", leak)
+                    "跨日不可卖批次 %s：上一个交易日的 T+1 份额不可卖且未处理，"
+                    "已按隔夜持仓转为底仓（不计入今日做T）", leak)
             self._day = today
-            self.book.reset()
             self._last_trigger.clear()
             self._count.clear()
             self._time_stop_fired.clear()
-            self._rebuy.clear()
+            # 跨日仍有待回买 = 昨日反T卖出后没在收盘前买回，底仓已实质减少。
+            # 不允许「无声消失」；缺口先计入 _base_gap 从可卖数量扣减（底仓确实少了）。
+            # 默认不追高回补，转成永久缺口等人工确认；
+            # 开启 trade.rebuy_carry 后改为「回买义务跨日有效」：锁保留、基准价仍是原卖出价，
+            # 价格回落时按 卖出价−rebuy_ticks 正常补回，补回多少就从缺口里减掉多少，
+            # 避免一次卖飞就把底仓额度永久判死（这正是可卖底仓被吃空、策略停摆的来源）。
+            gap_carry: Dict[str, float] = {}
+            keep_locks: List[str] = []
+            for _c, _v in self._rebuy.items():
+                try:
+                    _n = float(int(float((_v or {}).get("qty", 0) or 0)))
+                except Exception:
+                    _n = 0.0
+                if _n <= 0:
+                    continue
+                key = short_code(_c)
+                # 只有首次结转才累计缺口：保留中的锁跨日多天，若每天都加一次，
+                # 同一笔卖出会被重复扣减可卖数量；同标的多笔锁也必须累加而非覆盖
+                if not bool(_v.get("in_gap")):
+                    gap_carry[key] = float(gap_carry.get(key, 0.0) or 0.0) + _n
+                cf = self._trade_conf(key).get("rebuy_carry")
+                cf = cf if isinstance(cf, dict) else {}
+                if cf.get("enabled", False):
+                    _days = int(_v.get("carry_days", 0) or 0) + 1
+                    _max_days = int(cf.get("max_carry_days", 3) or 3)
+                    if _days <= _max_days:
+                        _v["carry_days"] = _days
+                        _v["in_gap"] = True   # 该笔数量已计入 _base_gap，补回时要扣回
+                        keep_locks.append(key)
+                        continue
+            if gap_carry:
+                for _c, _n in gap_carry.items():
+                    self._base_gap[_c] = float(self._base_gap.get(_c, 0.0) or 0.0) + _n
+                logging.getLogger("t_trader").warning(
+                    "跨日未回买 %s，已结转底仓缺口并从可卖数量扣减；累计缺口 %s"
+                    "（缺口清零：--reset-base-gap CODE 或状态文件 base_gap 置 0）",
+                    {c: int(n) for c, n in gap_carry.items()},
+                    {c: int(self._base_gap.get(c, 0) or 0) for c in gap_carry})
+            for _c in list(self._rebuy.keys()):
+                if short_code(_c) not in keep_locks:
+                    self._rebuy.pop(_c, None)
+            if keep_locks:
+                logging.getLogger("t_trader").info(
+                    "回买义务跨日保留 %s：仍按原卖出价 − rebuy_ticks 回买，"
+                    "到位即补回底仓并从缺口扣减",
+                    {c: int(float(self._rebuy[c].get("qty", 0) or 0)) for c in keep_locks})
             self._last_sell.clear()   # 卖出水位按日重置，昨天的高点不能当今天的卖出线
             self._stop_lock.clear()   # 止损冷静期锁只对当日有效
             self._sold_today.clear()
@@ -1331,13 +1436,21 @@ class SignalEngine:
         # 买入通道分流：存在反T闭环锁时，本轮买入只可能是「买回」，走独立类型，
         # 不再借用 BUY_FIRST，避免日志/弹窗/记录里把回买误显示成正T
         buy_stype = "REBUY" if self._rebuy.get(short_code(q.code)) else "BUY_FIRST"
-        for stype, keywords in ((buy_stype, "buy_first"), ("SELL_FIRST", "sell_first")):
+        # 回买走独立配置 signals.rebuy：复用 buy_first 会把正T的开关、阈值与振幅门槛
+        # 一起套到回买上，回买被错误过滤，反T就从「高卖低买」退化成「卖了补不回」。
+        buy_key = "rebuy" if buy_stype == "REBUY" else "buy_first"
+        for stype, keywords in ((buy_stype, buy_key), ("SELL_FIRST", "sell_first")):
             conf = self._signal_conf(keywords, q.code)
             checks = self._checks(q, pos, conf, stype)
             if circuit:
-                checks = checks + [Check(
-                    "日内亏损熔断", False,
-                    f"{circuit}；当日停止一切新开仓（已持仓仍由时间止损平仓，不受熔断影响）")]
+                if stype == "REBUY" and self._rebuy_force_active(q.code):
+                    checks = checks + [Check(
+                        "日内亏损熔断", True,
+                        f"{circuit}；但已到强制回补时点，补回底仓敞口优先于熔断停手")]
+                else:
+                    checks = checks + [Check(
+                        "日内亏损熔断", False,
+                        f"{circuit}；当日停止一切新开仓（已持仓仍由时间止损平仓，不受熔断影响）")]
             out[stype] = checks
             if all(c.ok for c in checks):
                 signals.append(self._build(q, pos, conf, stype, checks))
@@ -1380,7 +1493,11 @@ class SignalEngine:
         cost = pos["cost"]
         # 底仓可卖余量必须扣掉当日已卖出的股数，否则同一份底仓会被反复卖出（超卖）
         sold_today = float(self._sold_today.get(short_code(q.code), 0.0) or 0.0)
-        sellable = max(0.0, pos["sellable_qty"] - sold_today)
+        # 跨日未回买结转的底仓缺口必须先从可卖数量里扣掉：这些股数已经真的卖出去了，
+        # 还按原 sellable_qty 计算等于把不存在的底仓再卖一遍（超卖）。
+        base_gap = float(self._base_gap.get(short_code(q.code), 0.0) or 0.0)
+        sellable = max(0.0, pos["sellable_qty"] - base_gap - sold_today)
+        today = date.today().isoformat()
         rebuy = self._rebuy.get(short_code(q.code)) or None
         avg = q.avg_price
         dev = q.deviation_from_avg_pct()
@@ -1405,11 +1522,13 @@ class SignalEngine:
         # ---- 振幅过滤：当日波动空间不足以覆盖双边成本时，任何T都无利可图 ----
         min_amp = abs(float(trade.get("min_amplitude_pct", 0.0) or 0.0))
         amp = q.amplitude_pct
-        amp_ok = (min_amp <= 0.0) or (amp >= min_amp)
+        # 回买豁免振幅门槛：买回是补回已卖底仓、不新开仓，等振幅达标等于把缺口留过夜
+        amp_ok = (min_amp <= 0.0) or (amp >= min_amp) or (stype == "REBUY")
         checks.append(Check(
             "当日振幅足够", amp_ok,
             f"振幅 {amp:.2f}%" + (f"，门槛 ≥ {min_amp:.2f}%" if min_amp > 0 else "（未设门槛）")
-            + ("" if amp_ok else "，空间不足以覆盖成本，等波动放大再做")
+            + ("（回买豁免：补回已卖底仓，不新开仓，不等振幅）" if stype == "REBUY"
+               else ("" if amp_ok else "，空间不足以覆盖成本，等波动放大再做"))
         ))
 
         if stype == "REBUY":
@@ -1421,37 +1540,60 @@ class SignalEngine:
                 (f"待回买 {int(rebuy['qty'])} 股，卖出价 {fmt_price(float(rebuy['price']), d)}"
                  f"（{rebuy.get('at', '')} {rebuy.get('sig_id', '')}）") if rebuy
                 else "闭环锁已释放（可能已被其它信号回补），本轮不产生买回信号"))
+            force_close = self._rebuy_force_active(q.code)
             if rebuy:
                 rb_ticks = int(conf.get("rebuy_ticks", 0) or 0) \
                     or int(self.cfg["signals"]["sell_first"].get("target_ticks", 0) or 0) or 1
                 rb_line = round_price(max(tick, float(rebuy["price"]) - rb_ticks * tick), d)
-                checks.append(Check(
-                    "回买价达标（反T闭环）", q.price <= rb_line,
-                    f"现价 {fmt_price(q.price, d)} vs 回买线 {fmt_price(rb_line, d)}"
-                    f"（卖出价 {fmt_price(float(rebuy['price']), d)} − {rb_ticks} 跳，"
-                    f"待回买 {int(rebuy['qty'])} 股）"))
+                if force_close and q.price > rb_line:
+                    # 到点仍未回落到回买线：宁可少赚/小亏也要把底仓补回来，
+                    # 否则这笔敞口跨日结转成底仓缺口，可卖数量被永久扣减
+                    checks.append(Check(
+                        "回买价达标（反T闭环）", True,
+                        f"已到强制回补时点：现价 {fmt_price(q.price, d)} 高于回买线 "
+                        f"{fmt_price(rb_line, d)}，仍按现价回补 {int(rebuy['qty'])} 股"
+                        f"（卖出价 {fmt_price(float(rebuy['price']), d)}），不留缺口过夜"))
+                else:
+                    checks.append(Check(
+                        "回买价达标（反T闭环）", q.price <= rb_line,
+                        f"现价 {fmt_price(q.price, d)} vs 回买线 {fmt_price(rb_line, d)}"
+                        f"（卖出价 {fmt_price(float(rebuy['price']), d)} − {rb_ticks} 跳，"
+                        f"待回买 {int(rebuy['qty'])} 股）"))
             max_drop = -abs(float(conf.get("max_drop_pct", 3.0)))
-            checks.append(Check(
-                "跌幅未失控", q.change_pct >= max_drop,
-                f"当日 {q.change_pct:+.2f}%，阈值 ≥ {max_drop:.2f}%"))
+            if force_close:
+                checks.append(Check(
+                    "跌幅未失控", True,
+                    f"当日 {q.change_pct:+.2f}%，强制回补时点不设跌幅门槛（保底仓优先）"))
+            else:
+                checks.append(Check(
+                    "跌幅未失控", q.change_pct >= max_drop,
+                    f"当日 {q.change_pct:+.2f}%，阈值 ≥ {max_drop:.2f}%"))
             # 止损后冷静期同样约束买回：刚止损就原价接回等于白止损
-            self._stop_lock_checks(checks, q, d)
+            if force_close:
+                checks.append(Check(
+                    "止损后冷静期已过", True,
+                    "强制回补时点豁免冷静期与接回价门槛：底仓缺口比接回价差更贵"))
+            else:
+                self._stop_lock_checks(checks, q, d)
         elif stype == "BUY_FIRST":
             # ---- 标的类型：正T依赖「当日买入当日可卖」，股票 T+1 不可做 ----
             allow_t1 = bool(trade.get("allow_stock_t_plus_1", False))
             # 按标的配置判定，不能只看代码前缀：股票ETF（如 159325 半导体ETF）代码同为 15 开头，
             # 但实行 T+1，当日买入当日不可卖，正T无法闭环
             t0 = self._is_t0(q.code, pos)
-            # 反T回买不是新开T：回买只是补回此前卖出的底仓，register_fill 不会为它登记待平批次，
-            # 不产生「当日买入必须当日卖出」的约束，所以 T+1 标的也允许当日买回。
-            rebuy_pass = bool(rebuy)
+            # 底仓做T模式：T+1 标的（股票 / 股票ETF）当日买入不可卖，但只要有底仓，
+            # 就能用「当日买入 + 卖底仓」闭环做正T、「高卖底仓 + 当日买回」闭环做反T。
+            # 旧版把 T+1 一刀切判死，等于让有底仓的 159325 / 159866 完全无法做T。
+            # 放开后不会超卖：可卖数量由批次 sellable_from 与跨日底仓缺口共同约束。
+            base_t = bool(trade.get("allow_base_t_on_t1", True))
             checks.append(Check(
-                "标的支持T+0", t0 or allow_t1 or rebuy_pass,
-                ("反T回买放行：回买补回已卖底仓，不登记新T批次，T+1 标的亦可当日买回"
-                 if rebuy_pass and not t0 else
-                 "配置为当日买入当日可卖（跨境/债券/黄金/货币ETF），可做正T" if t0
-                 else ("标的为T+1（股票或股票ETF），当日买入不可卖；配置已强制放行，正T实际无法闭环，慎用"
-                       if allow_t1 else "标的为T+1（股票或股票ETF），当日买入不可卖，正T不成立（改用反T）"))
+                "标的支持当日做T", t0 or allow_t1 or base_t,
+                ("配置为当日买入当日可卖（跨境/债券/黄金/货币ETF），可做当日T" if t0
+                 else ("标的为T+1，按底仓做T放开：当日买入批次次日才可卖，卖出只核销底仓"
+                       if base_t else
+                       ("标的为T+1，配置已强制放行，当日买入不可卖，正T实际无法闭环，慎用"
+                        if allow_t1
+                        else "标的为T+1（股票或股票ETF），当日买入不可卖，未开启底仓做T，放弃")))
             ))
 
             # 阈值同时按百分比与跳数判定，取更严的一方：低价ETF 0.3% 不足 3 跳时以跳数为准
@@ -1460,81 +1602,88 @@ class SignalEngine:
             thr_tick = -(dev_ticks * tick / q.price * 100.0) if (dev_ticks > 0 and q.price > 0) else 0.0
             threshold = min(thr_pct, thr_tick) if thr_tick else thr_pct
             support = self._support_price(q, conf)
-            if rebuy:
-                # 反T闭环：已高卖待回买时，买入判定改为「回到卖价下方 N 跳」，不再看均价与支撑，
-                # 否则高卖之后同一条均价线条件会与回买窗口互斥，回买永远不成立。
-                rb_ticks = int(conf.get("rebuy_ticks", 0) or 0) \
-                    or int(self.cfg["signals"]["sell_first"].get("target_ticks", 0) or 0) or 1
-                rb_line = round_price(max(tick, float(rebuy["price"]) - rb_ticks * tick), d)
-                checks.append(
-                    Check("回买价达标（反T闭环）", q.price <= rb_line,
-                          f"现价 {fmt_price(q.price, d)} vs 回买线 {fmt_price(rb_line, d)}"
-                          f"（卖出价 {fmt_price(float(rebuy['price']), d)} − {rb_ticks} 跳，"
-                          f"待回买 {int(rebuy['qty'])} 股）")
-                )
-            else:
-                # 偏离分级：温和偏离只是「便宜」，需量能确认；明显超跌才是「错杀」，直接放行
-                s_pct = -abs(float(conf.get("strong_dev_pct", 0.0) or 0.0))
-                s_ticks = int(conf.get("strong_dev_ticks", 0) or 0)
-                s_tick = -(s_ticks * tick / q.price * 100.0) if (s_ticks > 0 and q.price > 0) else 0.0
-                # 强档两侧门槛取「更易达到」的一方（绝对值更小），与弱档取更严的方向相反：
-                # 弱档要给足空间，强档只要确认「跌得足够狠」，二者任一满足即成立
-                s_cands = [x for x in (s_pct, s_tick) if x < 0]
-                strong_thr = max(s_cands) if s_cands else 0.0
-                is_strong = (strong_thr < 0) and (dev <= strong_thr)
-                dev_ok = dev <= threshold
-                checks.append(
-                    Check("低于分时均价线", dev_ok,
-                          f"偏离 {dev:+.2f}%，阈值 ≤ {threshold:.2f}%"
-                          + (f"（{dev_ticks} 跳 ≈ {abs(thr_tick):.2f}%，1 跳 = {fmt_price(tick, d)}）"
-                             if thr_tick else "（仅按百分比）")
-                          + (f"｜已到强档 ≤ {strong_thr:.2f}%，免量能确认" if is_strong
-                             else (f"｜弱档，需量能确认（强档线 {strong_thr:.2f}%）"
-                                   if strong_thr < 0 else "")))
-                )
-                # ---- 量能确认：温和偏离必须放量承接，避免无量阴跌一路抄底 ----
-                vmode = str(conf.get("volume_confirm", "off") or "off").strip().lower()
-                need_vol = (vmode == "always") or (vmode == "weak" and dev_ok and not is_strong)
-                if need_vol:
-                    vwin = float(conf.get("volume_window_sec", 60) or 60)
-                    vbase = float(conf.get("volume_baseline_sec", 300) or 300)
-                    vneed = float(conf.get("volume_ratio", 1.2) or 1.2)
-                    vdir = str(conf.get("volume_dir", "surge") or "surge").strip().lower()
-                    vr = self._volume_ratio(q.code, vwin, vbase)
-                    if vr is None:
-                        checks.append(Check(
-                            "量能确认", True,
-                            f"量能样本不足（需 ≥ {int(vwin + vbase)} 秒，刚开盘或刚重启），"
-                            "本次跳过量能确认"))
-                    elif vdir == "shrink":
-                        vline = (1.0 / vneed) if vneed > 0 else 1.0
-                        checks.append(Check(
-                            "量能确认（缩量）", vr <= vline,
-                            f"近 {int(vwin)} 秒量能 {vr:.2f}× 前 {int(vbase)} 秒均速，"
-                            f"要求 ≤ {vline:.2f}×（卖压衰竭才低吸）"))
-                    else:
-                        checks.append(Check(
-                            "量能确认（放量）", vr >= vneed,
-                            f"近 {int(vwin)} 秒量能 {vr:.2f}× 前 {int(vbase)} 秒均速，"
-                            f"要求 ≥ {vneed:.2f}×（有承接盘才低吸）"))
-                # 支撑线与买入线上限冲突时以阈值为准：否则「跌破均价 N 跳」与「不破支撑」
-                # 可能构成空集，买入信号将永远无法产生。
-                buy_line = q.avg_price * (1 + threshold / 100.0) if q.avg_price > 0 else 0.0
-                support_conflict = support > 0 and buy_line > 0 and support > buy_line
-                if support_conflict:
-                    support_desc = (f"现价 {fmt_price(q.price, d)} vs 支撑 {fmt_price(support, d)}"
-                                    f" vs 买入线 {fmt_price(buy_line, d)}"
-                                    f"（支撑高于买入线，判定冲突，以阈值为准）")
+            # 偏离分级：温和偏离只是「便宜」，需量能确认；明显超跌才是「错杀」，直接放行
+            s_pct = -abs(float(conf.get("strong_dev_pct", 0.0) or 0.0))
+            s_ticks = int(conf.get("strong_dev_ticks", 0) or 0)
+            s_tick = -(s_ticks * tick / q.price * 100.0) if (s_ticks > 0 and q.price > 0) else 0.0
+            # 强档两侧门槛取「更易达到」的一方（绝对值更小），与弱档取更严的方向相反：
+            # 弱档要给足空间，强档只要确认「跌得足够狠」，二者任一满足即成立
+            s_cands = [x for x in (s_pct, s_tick) if x < 0]
+            strong_thr = max(s_cands) if s_cands else 0.0
+            is_strong = (strong_thr < 0) and (dev <= strong_thr)
+            dev_ok = dev <= threshold
+            checks.append(
+                Check("低于分时均价线", dev_ok,
+                      f"偏离 {dev:+.2f}%，阈值 ≤ {threshold:.2f}%"
+                      + (f"（{dev_ticks} 跳 ≈ {abs(thr_tick):.2f}%，1 跳 = {fmt_price(tick, d)}）"
+                         if thr_tick else "（仅按百分比）")
+                      + (f"｜已到强档 ≤ {strong_thr:.2f}%，免量能确认" if is_strong
+                         else (f"｜弱档，需量能确认（强档线 {strong_thr:.2f}%）"
+                               if strong_thr < 0 else "")))
+            )
+            # ---- 量能确认：温和偏离必须放量承接，避免无量阴跌一路抄底 ----
+            vmode = str(conf.get("volume_confirm", "off") or "off").strip().lower()
+            need_vol = (vmode == "always") or (vmode == "weak" and dev_ok and not is_strong)
+            if need_vol:
+                vwin = float(conf.get("volume_window_sec", 60) or 60)
+                vbase = float(conf.get("volume_baseline_sec", 300) or 300)
+                vneed = float(conf.get("volume_ratio", 1.2) or 1.2)
+                vdir = str(conf.get("volume_dir", "surge") or "surge").strip().lower()
+                vr = self._volume_ratio(q.code, vwin, vbase)
+                if vr is None:
+                    checks.append(Check(
+                        "量能确认", True,
+                        f"量能样本不足（需 ≥ {int(vwin + vbase)} 秒，刚开盘或刚重启），"
+                        "本次跳过量能确认"))
+                elif vdir == "shrink":
+                    vline = (1.0 / vneed) if vneed > 0 else 1.0
+                    checks.append(Check(
+                        "量能确认（缩量）", vr <= vline,
+                        f"近 {int(vwin)} 秒量能 {vr:.2f}× 前 {int(vbase)} 秒均速，"
+                        f"要求 ≤ {vline:.2f}×（卖压衰竭才低吸）"))
                 else:
-                    support_desc = (f"现价 {fmt_price(q.price, d)} vs 支撑 {fmt_price(support, d)}"
-                                    + ("" if q.price >= support else "（已跌破，放弃低吸）"))
-                checks.append(
-                    Check("未破当日支撑", (q.price >= support) or support_conflict, support_desc)
-                )
+                    checks.append(Check(
+                        "量能确认（放量）", vr >= vneed,
+                        f"近 {int(vwin)} 秒量能 {vr:.2f}× 前 {int(vbase)} 秒均速，"
+                        f"要求 ≥ {vneed:.2f}×（有承接盘才低吸）"))
+            # 支撑线与买入线上限冲突时以阈值为准：否则「跌破均价 N 跳」与「不破支撑」
+            # 可能构成空集，买入信号将永远无法产生。
+            buy_line = q.avg_price * (1 + threshold / 100.0) if q.avg_price > 0 else 0.0
+            support_conflict = support > 0 and buy_line > 0 and support > buy_line
+            if support_conflict:
+                support_desc = (f"现价 {fmt_price(q.price, d)} vs 支撑 {fmt_price(support, d)}"
+                                f" vs 买入线 {fmt_price(buy_line, d)}"
+                                f"（支撑高于买入线，判定冲突，以阈值为准）")
+            else:
+                support_desc = (f"现价 {fmt_price(q.price, d)} vs 支撑 {fmt_price(support, d)}"
+                                + ("" if q.price >= support else "（已跌破，放弃低吸）"))
+            checks.append(
+                Check("未破当日支撑", (q.price >= support) or support_conflict, support_desc)
+            )
             max_drop = -abs(float(conf.get("max_drop_pct", 3.0)))
             checks.append(
                 Check("跌幅未失控", q.change_pct >= max_drop,
                       f"当日 {q.change_pct:+.2f}%，阈值 ≥ {max_drop:.2f}%")
+            )
+            # ---- 当日弱势禁买：单边下跌里低吸，等于在下跌途中一路接刀 ----
+            # 两条判据任一命中即禁止开新正T：① 当日跌幅已 ≤ weak_guard_drop_pct（缺省 −2.0%）；
+            # ② 现价相对分时均价线偏离 < weak_guard_dev_pct（缺省 −1.5%，即明显弱于均价线）。
+            # 只拦「开新正T」，不拦 REBUY（反T回买是补敞口，越弱越该补）。
+            # 参数只走代码缺省值兜底，不写入 config.json，避免与既有阈值项混在一起。
+            wg_drop = -abs(float(conf.get("weak_guard_drop_pct", -2.0) or 0.0))
+            wg_dev = -abs(float(conf.get("weak_guard_dev_pct", -1.5) or 0.0))
+            weak_hit = []
+            if wg_drop < 0 and q.change_pct <= wg_drop:
+                weak_hit.append(f"当日跌幅 {q.change_pct:+.2f}% ≤ {wg_drop:.2f}%")
+            if wg_dev < 0 and avg > 0 and dev < wg_dev:
+                weak_hit.append(f"较均价线偏离 {dev:+.2f}% < {wg_dev:.2f}%")
+            checks.append(
+                Check("当日未走弱", not weak_hit,
+                      f"当日 {q.change_pct:+.2f}%（弱势线 ≤ {wg_drop:.2f}%），"
+                      f"较均价线 {dev:+.2f}%（弱势线 < {wg_dev:.2f}%）"
+                      + ("" if not weak_hit else
+                         "：" + "；".join(weak_hit)
+                         + "，当日走弱，此时低吸容易接在下跌途中，不再开新正T"))
             )
             if conf.get("check_cost"):
                 tol = abs(float(conf.get("cost_tolerance_pct", 1.0)))
@@ -1544,31 +1693,52 @@ class SignalEngine:
                           f"现价 {fmt_price(q.price, d)} vs 上限 {fmt_price(limit, d)}"
                           if cost > 0 else "未配置成本，跳过")
                 )
-            # 正T只允许单批次滚动，未平仓前不再叠加买入，避免越跌越买变成加仓
+            # 正T只允许单批次滚动：占用批数 =（待平批次股数 + 待回买股数）按「单批计划股数」折算。
+            # _rebuy 代表「已高卖、尚未回买」的未闭环敞口，必须继续占用批数名额，保持单批限制语义。
+            # 底仓缺口 _base_gap 不再计入批数：它是「反T卖出后跨日仍未回买」的量，本身就是一笔
+            # 真实存在的底仓敞口；再按单批折算一次等于同一份敞口罚两次，后果是一旦结转缺口
+            # 就永久锁死正T（基线里 967/1009 次「未平批次数量」拦截全来自这里）。
+            # 缺口改由 max_base_gap_qty 单独约束：缺省 0 表示不单独限制（只看批数），
+            # >0 时缺口股数超过该值即拒绝开新正T。
             max_batches = int(trade.get("max_pending_batches", 1) or 0)
-            pending_n = len(self.book.pending(q.code))
-            batch_ok = (max_batches <= 0) or (pending_n < max_batches)
+            plan_buy = float(self._plan_qty(q, "buy") or 0.0)
+            pend_batches = len(self.book.pending(q.code))
+            pend_qty = float(self.book.pending_qty(q.code) or 0.0)
+            rb_qty = float((rebuy or {}).get("qty", 0.0) or 0.0)
+            exp_qty = pend_qty + rb_qty
+            unit = plan_buy if plan_buy >= 100 else 0.0
+            if unit > 0:
+                exp_batches = (int((exp_qty - 1e-9) // unit) + 1) if exp_qty > 0 else 0
+            else:
+                exp_batches = 1 if exp_qty > 0 else 0
+            batch_ok = (max_batches <= 0) or (exp_batches < max_batches)
+            # 底仓缺口上限：参数只走代码缺省值兜底，不写进 config.json
+            gap_limit = float(trade.get("max_base_gap_qty", 0.0) or 0.0)
+            gap_ok = (gap_limit <= 0) or (base_gap <= gap_limit + 1e-9)
             checks.append(
-                Check("未平批次数量", batch_ok or bool(rebuy),
-                      f"当前待平 {pending_n} 批"
+                Check("未平批次数量", batch_ok and gap_ok,
+                      f"待平 {int(pend_qty)} 股（{pend_batches} 批）"
+                      f" + 待回买 {int(rb_qty)} 股 = {int(exp_qty)} 股，"
+                      f"按单批 {int(unit)} 股折算占用 {exp_batches} 批"
                       + ("（不限批数）" if max_batches <= 0 else f"，上限 {max_batches} 批")
-                      + ("，反T回买放行" if rebuy else ("" if batch_ok else "，先平掉再买")))
+                      + f"；底仓缺口 {int(base_gap)} 股"
+                      + ("（未设上限）" if gap_limit <= 0 else f"，上限 {int(gap_limit)} 股")
+                      + ("" if (batch_ok and gap_ok)
+                         else ("，先平掉/补回再买" if not batch_ok
+                               else "，底仓缺口超限，先补回缺口再开正T")))
             )
             need = self._plan_qty(q, "buy")
-            # 可卖数量只约束「新开正T」：买入后必须还能卖回去。
-            # 反T回买是补回已卖出的底仓，后续不需要再卖出，刚卖掉底仓时可卖余额已被占用，
-            # 若同样受此约束，反T回买将永远不成立，底仓缺口只能留到明天。
+            # 可卖数量只约束「新开正T」：买入后必须还能卖回去，否则等于加仓。
+            # 已扣掉跨日未回买结转的底仓缺口与今日已卖数量，避免把不存在的底仓再算一遍。
             checks.append(
-                Check("底仓可卖数量足够", bool(rebuy) or (sellable >= need),
-                      ("反T回买放行：回买补回已卖底仓，不依赖当日剩余可卖数量"
-                       if rebuy else
-                       f"可卖 {int(sellable)} 股，正T买入 {int(need)} 股后需能卖回"
-                       f"（{self._qty_desc(q, 'buy')}）"))
+                Check("底仓可卖数量足够", sellable >= need,
+                      f"可卖 {int(sellable)} 股（已扣跨日底仓缺口 {int(base_gap)} 股），"
+                      f"正T买入 {int(need)} 股后需能卖回（{self._qty_desc(q, 'buy')}）")
             )
             # ---- 不留隔夜：收盘前 close_guard_minutes 分钟内不再开新正T ----
             # 正T闭环要求当日买入当日卖回；离开收盘不足 guard 分钟时新买必然留到明天，直接锁死。
-            # 反T回买豁免：回买是补回已卖出的底仓，不产生待平批次，拦住它反而会让底仓缺口留过夜。
-            if bool(trade.get("no_overnight", True)) and not rebuy:
+            # 反T回买走 REBUY 分支（evaluate 已分流），不受此处约束，因此底仓缺口可以在盘中任何时点补回。
+            if bool(trade.get("no_overnight", True)):
                 guard = int(trade.get("close_guard_minutes", 10) or 0)
                 cut = None
                 for _s, _e in (trade.get("sessions") or []):
@@ -1706,10 +1876,14 @@ class SignalEngine:
                           if cost > 0 else "未配置持仓成本，跳过历史成本校验")
                 )
             need = self._plan_qty(q, "sell")
+            # 底仓保留线：可卖余量扣掉保留线后仍够本次卖出，才允许开新反T。
+            # 卖后不回买是单向失血，一旦可卖余量归零，连做T的资格都没有了。
+            reserve = abs(float(trade.get("min_sellable_reserve", 0) or 0))
             checks.append(
-                Check("可卖底仓足够", sellable >= need,
+                Check("可卖底仓足够", sellable - reserve >= need,
                       f"可卖 {int(sellable)} 股"
                       + (f"（底仓 {int(pos['sellable_qty'])} 已卖 {int(sold_today)}）" if sold_today > 0 else "")
+                      + (f"，扣除保留线 {int(reserve)} 股" if reserve > 0 else "")
                       + f"，需卖 {int(need)} 股（{self._qty_desc(q, 'sell')}）")
             )
 
@@ -1752,6 +1926,28 @@ class SignalEngine:
                     "反T卖出次数上限", used_sell < sell_cap,
                     f"今日已卖 {used_sell} 次，上限 {sell_cap} 次"
                     + ("" if used_sell < sell_cap else "，今日不再高卖，等明日重置")))
+            # ---- 不留隔夜（反T）：收盘前 close_guard_minutes 分钟内不再新开反T ----
+            # 反T必须当日买回才闭环；离收盘不足 guard 分钟时卖出大概率买不回来，
+            # 只能结转成底仓缺口过夜，所以这里直接拦掉新开的反T。
+            if bool(trade.get("no_overnight", True)):
+                guard_min = int(trade.get("close_guard_minutes", 10) or 0)
+                cut = None
+                for _ses in (trade.get("sessions") or []):
+                    try:
+                        _end = parse_hhmm(str(_ses[1]))
+                    except Exception:
+                        continue
+                    if cut is None or _end > cut:
+                        cut = _end
+                if guard_min > 0 and cut is not None:
+                    _now = datetime.now().time()
+                    left_min = max(0.0, (datetime.combine(date.today(), cut)
+                                         - datetime.combine(date.today(), _now)).total_seconds() / 60.0)
+                    checks.append(Check(
+                        "收盘前不留新反T", left_min > guard_min,
+                        f"距收盘 {left_min:.0f} 分钟，门槛 > {guard_min} 分钟"
+                        + ("" if left_min > guard_min else
+                           "：已进入收盘保护区，此时高卖当日来不及回买，不再新开反T")))
 
         cooldown = int(trade["cooldown_sec"])
         last = self._last_trigger.get((short_code(q.code), stype))
@@ -1768,6 +1964,22 @@ class SignalEngine:
         used = self._count.get((short_code(q.code), stype), 0)
         checks.append(Check("当日次数上限", used < limit, f"已触发 {used} 次，上限 {limit} 次"))
         return checks
+
+    def _rebuy_force_active(self, code: str = "") -> bool:
+        """收盘前强制回补是否已到点。
+
+        反T 卖出后若当日没买回，底仓就已实质减少；旧逻辑把它结转成底仓缺口并
+        「不追高回补」，缺口只会单向累积，最终把可卖底仓吃空、策略彻底停摆。
+        到点后未回买敞口必须了结：价格线、跌幅、冷静期、熔断一律让位给「保住底仓」。
+        """
+        conf = self._trade_conf(code).get("rebuy_force") if code else self.cfg["trade"].get("rebuy_force")
+        if not isinstance(conf, dict) or not conf.get("enabled", False):
+            return False
+        try:
+            deadline = parse_hhmm(str(conf.get("deadline", "14:45")))
+        except Exception:
+            deadline = parse_hhmm("14:45")
+        return datetime.now().time() >= deadline
 
     def _stop_lock_checks(self, checks: List[Check], q: Quote, d: int) -> None:
         """止损后冷静期与接回门槛：正T与买回两条买入通道共用。"""
@@ -1840,7 +2052,16 @@ class SignalEngine:
         basis = str(conf.get("basis", "batch") or "batch").lower()
         pending = self.book.pending_qty(q.code)
         if basis == "batch" and pending > 0:
-            return self.book.weighted_cost(q.code), f"当日买入批次加权成本·待平{int(pending)}股"
+            cost = self.book.weighted_cost(q.code)
+            if cost > 0 and q.price >= cost:
+                return cost, f"当日买入批次加权成本·待平{int(pending)}股"
+            # 待平批次已经浮亏：按「批次成本 + 目标」当地板价，只会让卖出侧永久不触发（价格回不到成本上），
+            # 反T（高卖底仓、低买回）就彻底失效。反T盈亏只取决于「卖价 > 回买价」，
+            # 因此这种情形退回当日分时均价当基准，批次仍按 FIFO 正常核销。
+            if q.avg_price > 0:
+                return float(q.avg_price), (
+                    f"待平{int(pending)}股浮亏（成本{cost:.4f} > 现价{q.price:.4f}）"
+                    "·反T改用当日分时均价作高卖基准")
         if basis == "day_avg" and q.avg_price > 0:
             return float(q.avg_price), "当日分时均价"
         # basis=batch 但当天还没有买入批次，说明这一轮是「无底仓平T目标」的反T（高卖底仓、低买回），
@@ -1913,9 +2134,26 @@ class SignalEngine:
         conf = self._time_stop_conf(q.code)
         if not conf.get("enabled", False):
             return None
+        _day = date.today().isoformat()
+        # 判定批次来源用「全部待平批次」book.pending，包含当日买入、sellable_from 为次日的批次。
+        # 旧实现用 sellable_pending 把这些当日新仓整体剔除，导致 T+1 标的当日买入的批次当天完全
+        # 不参与时间层（deadline / max_hold）与价格层（loss_pct）：11-19 10:10 以 0.779 买入的
+        # 2000 股当天没被止损，一直拖到 11-20 09:30 才按 0.779 平掉（净利 −1 元），期间还占着
+        # 唯一的批次名额，正T 全天无法再开。当日必须能止损，所以判定来源改为 pending。
+        # 一致性由三处对齐保证：① 本函数判定与发单量都用 pending；
+        # ② _build 里 TIME_STOP 的下单量同样取 pending；
+        # ③ register_fill 里 TIME_STOP 核销走 consume(code, qty) 不传 day（FIFO），
+        #    卖出量与核销批次一一对应，不会出现「卖了底仓、当日新仓仍挂账」的重复平仓。
+        # 成交层面仍受底仓额度约束：T+1 标的当日买入不可卖，卖出的只能是底仓额度，
+        # 因此文案上要把「当日新仓以底仓额度平仓」和「跨日批次」分开说明。
         bs = self.book.pending(q.code)
         if not bs:
             return None
+        # 当日新仓（sellable_from 晚于今天）与跨日批次（买入日不是今天）分别标注：
+        # 前者卖掉的是底仓额度，后者才是真正把该批次平掉。
+        new_today = [b for b in bs if b.sellable_from and b.sellable_from > _day]
+        cross_day = [b for b in bs
+                     if datetime.fromtimestamp(float(b.opened_at or 0)).date().isoformat() != _day]
         d = q.decimals
         tick = price_tick(d)
         short = short_code(q.code)
@@ -1926,8 +2164,13 @@ class SignalEngine:
         deadline_text = str(tl.get("deadline", "14:50"))
         deadline = parse_hhmm(deadline_text)
         max_hold = float(tl.get("max_hold_minutes", 0) or 0)
-        hold = self.book.hold_minutes(q.code)
-        cost_price = self.book.weighted_cost(q.code)
+        # 持有分钟与成本都按「全部待平批次」算：判定对象、发单量、核销批次必须是同一批份额，
+        # 否则会出现「按当日新仓的持有时长判定、核销的却是旧批次」的口径错位。
+        hold = ((time.time() - float(bs[0].opened_at or 0)) / 60.0) if bs else 0.0
+        hold = max(0.0, hold)
+        _bs_qty = float(sum(float(b.qty) for b in bs))
+        cost_price = ((sum(float(b.cost_price or 0) * float(b.qty) for b in bs) / _bs_qty)
+                      if _bs_qty > 0 else 0.0)
         pnl_pct = (q.price / cost_price - 1) * 100.0 if cost_price > 0 else 0.0
 
         # ---- 止损距离必须不小于目标距离 ----
@@ -1944,18 +2187,34 @@ class SignalEngine:
         loss_limit = -loss_pct_eff
 
         reasons: List[str] = []
+        cross_note = ""
+        if cross_day:
+            _cd = datetime.fromtimestamp(float(cross_day[0].opened_at or 0))
+            cross_note = (f"（含跨日批次 {len(cross_day)} 批"
+                          f" {int(sum(b.qty for b in cross_day))} 股，"
+                          f"最早买入 {_cd.strftime('%Y-%m-%d %H:%M')}，"
+                          f"已持有 {hold:.0f} 分钟）")
+        # 当日新仓的单列一段文案：这批份额当日不可卖，平仓动用的是底仓额度，
+        # 不能让使用者误以为卖掉的就是当天买进的那 2000 股。
+        today_note = ""
+        if new_today:
+            today_note = (f"（含当日新仓 {len(new_today)} 批"
+                          f" {int(sum(b.qty for b in new_today))} 股，"
+                          f"T+1 当日买入不可卖，本次以底仓额度平仓）")
         if tl.get("enabled", True):
             if bool(tl.get("trigger_on_deadline", True)) and now_t >= deadline:
-                reasons.append(f"〔时间层〕已到强制平仓时点 {deadline_text}")
+                reasons.append(f"〔时间层〕已到强制平仓时点 {deadline_text}{cross_note}{today_note}")
             if max_hold > 0 and hold >= max_hold:
-                reasons.append(f"〔时间层〕持有 {hold:.0f} 分钟 ≥ 上限 {max_hold:.0f} 分钟")
+                reasons.append(f"〔时间层〕持有 {hold:.0f} 分钟 ≥ 上限 {max_hold:.0f} 分钟"
+                               f"{cross_note}{today_note}")
         if pl.get("enabled", True) and loss_limit < 0 and pnl_pct <= loss_limit:
             reasons.append(f"〔价格层〕浮亏 {pnl_pct:+.2f}% 触及 {loss_limit:.2f}%")
 
         # ---- 可卖余额截断：T+1 标的早盘买进的份额当日不可卖，止损单发出去只会是废单 ----
         sold_today = float(self._sold_today.get(short, 0.0) or 0.0)
-        sellable = max(0.0, float(pos.get("sellable_qty", 0) or 0) - sold_today)
-        pending_ord = float(self.book.pending_qty(q.code))
+        sellable = max(0.0, float(pos.get("sellable_qty", 0) or 0)
+                        - float(self._base_gap.get(short, 0.0) or 0.0) - sold_today)
+        pending_ord = float(sum(float(b.qty) for b in bs))
         avail = min(pending_ord, sellable)
         avail = float(int(avail // 100) * 100) if avail >= 100 else 0.0
         checks = [
@@ -1966,10 +2225,19 @@ class SignalEngine:
                   f"（浮亏 {loss_pct_eff:.2f}%）"),
             Check("存在待平批次", True, self.book.snapshot(q.code)),
             Check("可卖余额足够", avail >= 100,
-                  f"待平 {int(pending_ord)} 股，可卖 {int(sellable)} 股"
-                  f"（底仓 {int(pos.get('sellable_qty', 0) or 0)} 已卖 {int(sold_today)}），"
+                  f"待平 {int(pending_ord)} 股"
+                  f"（当日新仓 {len(new_today)} 批 {int(sum(b.qty for b in new_today))} 股、"
+                  f"跨日批次 {len(cross_day)} 批 {int(sum(b.qty for b in cross_day))} 股），"
+                  f"可卖余额 {int(sellable)} 股"
+                  f"（底仓 {int(pos.get('sellable_qty', 0) or 0)}"
+                  f" − 底仓缺口 {int(float(self._base_gap.get(short, 0.0) or 0.0))}"
+                  f" − 已卖 {int(sold_today)}），"
                   f"本次可平 {int(avail)} 股"
-                  + ("" if avail >= 100 else "：当日买入份额不可卖，发单必成废单，本次不平仓")),
+                  + ("：当日新仓以底仓额度平仓（卖掉的是底仓，当日买入份额本身仍不可卖）"
+                     if new_today and not cross_day else
+                     ("：跨日批次，卖出即核销该批次" if cross_day and not new_today else ""))
+                  + ("" if avail >= 100 else
+                     "：底仓可卖额度不足 100 股（已扣跨日缺口与今日已卖），本次只提示不下单")),
             Check("止损距离不小于目标距离", loss_pct_eff >= target_dist - 1e-9,
                   f"止损 {loss_pct_eff:.2f}% vs 目标距离 {target_dist:.2f}%"
                   f"（{target_ticks} 跳 ≈ {dist_by_tick:.2f}%，{target_pct:.2f}%）"
@@ -1995,7 +2263,17 @@ class SignalEngine:
 
     def _build_time_stop(self, q: Quote, pos: Dict[str, Any]) -> Signal:
         conf = dict(self.cfg["signals"]["sell_first"])
-        checks = [Check("时间止损", True, self.book.snapshot(q.code))]
+        # 下单理由里同步标注这批待平的份额是「当日新仓」还是「跨日批次」：
+        # T+1 标的当日买入不可卖，平仓动用的是底仓额度，日志里必须让复核者一眼看出来。
+        _day = date.today().isoformat()
+        bs = self.book.pending(q.code)
+        new_today = [b for b in bs if b.sellable_from and b.sellable_from > _day]
+        note = self.book.snapshot(q.code)
+        if new_today:
+            note += (f"（含当日新仓 {len(new_today)} 批"
+                     f" {int(sum(b.qty for b in new_today))} 股，"
+                     f"T+1 当日买入不可卖，本次以底仓额度平仓）")
+        checks = [Check("时间止损", True, note)]
         return self._build(q, pos, conf, "TIME_STOP", checks)
 
     # ---- 成交回报：登记/核销批次台账 ----
@@ -2028,6 +2306,12 @@ class SignalEngine:
                     else:
                         self._rebuy.pop(short, None)
                         parts.append(f"反T闭环完成，回买 {int(filled)} 股（卖出价 {sold_at}）")
+                    # 跨日保留的回买义务补回后，底仓缺口要同步扣减，
+                    # 否则缺口只增不减，可卖数量被永久压低
+                    if rebuy.get("in_gap"):
+                        _left = max(0.0, float(self._base_gap.get(short, 0.0) or 0.0) - filled)
+                        self._base_gap[short] = _left
+                        parts.append(f"底仓缺口扣减 {int(filled)} 股，剩余缺口 {int(_left)} 股")
                     # 回买补回的份额解除底仓占用，当日可再次卖出
                     self._sold_today[short] = max(
                         0.0, float(self._sold_today.get(short, 0.0) or 0.0) - filled)
@@ -2045,7 +2329,16 @@ class SignalEngine:
             open_qty = max(0.0, qty - filled)
             if open_qty > 1e-9:
                 open_fee = fee * (open_qty / qty) if qty > 0 else 0.0
-                self.book.add(sig.code, price, open_qty, fee=open_fee, signal_id=sig.signal_id)
+                # T+1 标的当日买入的批次当日不可卖：可卖起始日 = 次一交易日；
+                # T+0 标的当日买入即可卖，留空表示不受限。
+                sellable_from = ""
+                if not self._is_t0(sig.code, self.position(sig.code)):
+                    _nxt = date.fromordinal(date.today().toordinal() + 1)
+                    while _nxt.weekday() >= 5:
+                        _nxt = date.fromordinal(_nxt.toordinal() + 1)
+                    sellable_from = _nxt.isoformat()
+                self.book.add(sig.code, price, open_qty, fee=open_fee, signal_id=sig.signal_id,
+                              sellable_from=sellable_from)
                 parts.append(f"登记待平批次 {int(open_qty)}股@{fmt_price(price, sig.decimals)}"
                              f"（佣金约 {open_fee:.2f} 元）")
             elif filled > 0:
@@ -2061,14 +2354,24 @@ class SignalEngine:
         # 净持仓同步递减：时间止损等平仓不登记待回买，底仓缺口只能靠这里暴露
         self._net_pos[short] = float(self._net_pos.get(short, 0.0) or 0.0) - float(sig.suggested_qty)
         sold_price = float(sig.suggested_price or sig.price)
+        # TIME_STOP 的核销必须 FIFO 且不传 day：时间止损的判定与发单来源都是全部待平批次
+        # （含当日买入、次日才可卖的批次）。若这里仍按 day 过滤，consume 会跳过当日新仓，
+        # 结果卖出的股数（底仓额度）没有对应批次被核销，当日新仓继续挂账、次日被再平一次。
+        # 不传 day 后按 FIFO 优先核销最早的旧批次，卖出量与核销批次一一对应。
+        _consume_day = "" if sig.stype == "TIME_STOP" else date.today().isoformat()
+        used = self.book.consume(sig.code, sig.suggested_qty, _consume_day)
+        covered = sum(float(b.qty) for b in used)
         if sig.stype == "SELL_FIRST":
-            # 反T闭环：高卖后登记待回买批次，未回买前不再对同一标的出卖出信号
-            self._rebuy[short] = {
-                "qty": float(sig.suggested_qty),
-                "price": sold_price,
-                "at": sig.triggered_at,
-                "sig_id": sig.signal_id,
-            }
+            # 反T闭环只针对「卖掉底仓」的那部分数量：本次卖出若已核销掉待平批次（正T平仓），
+            # 底仓并未减少，再挂回买锁会让随后那笔回买变成净加仓，因此只对未被批次覆盖的缺口挂锁。
+            gap_qty = max(0.0, float(sig.suggested_qty) - covered)
+            if gap_qty > 1e-9:
+                self._rebuy[short] = {
+                    "qty": gap_qty,
+                    "price": sold_price,
+                    "at": sig.triggered_at,
+                    "sig_id": sig.signal_id,
+                }
             # 卖出水位：记录本笔成交价，闭环完成后再补 closed_price，
             # 用于拦住「越卖越低」的连续倒手（只在反T卖出时更新，时间止损不参与）
             self._last_sell[short] = {
@@ -2076,10 +2379,12 @@ class SignalEngine:
                 "at": sig.triggered_at,
                 "sig_id": sig.signal_id,
             }
-        used = self.book.consume(sig.code, sig.suggested_qty)
-        tail = (f"已登记待回买 {int(sig.suggested_qty)} 股@{fmt_price(sold_price, sig.decimals)}，"
-                f"未回买前不再重复卖出"
-                if sig.stype == "SELL_FIRST" else "未登记待回买（时间止损平仓不参与反T闭环）")
+        tail = (f"已登记待回买 {int(max(0.0, float(sig.suggested_qty) - covered))} 股"
+                f"@{fmt_price(sold_price, sig.decimals)}，未回买前不再重复卖出"
+                if sig.stype == "SELL_FIRST" and max(0.0, float(sig.suggested_qty) - covered) > 1e-9
+                else ("本次卖出已全部核销待平批次（正T平仓），底仓未减少，不登记待回买"
+                      if sig.stype == "SELL_FIRST"
+                      else "未登记待回买（时间止损平仓不参与反T闭环）"))
         if not used:
             self.save_state()
             return (f"卖出已执行但无买入批次可核销（{sig.code}），台账保持为空；{tail}"
@@ -2094,14 +2399,25 @@ class SignalEngine:
         self._realized[short] = float(self._realized.get(short, 0.0) or 0.0) + realized
         if sig.stype == "TIME_STOP":
             self._time_stop_fired.pop(short, None)
-            # 止损后冷静期锁：冷静期内禁止新正T；冷静期满后仍需低于止损价 reentry_gap_pct 才允许接回
-            self._stop_lock[short] = {
-                "at": time.time(),
-                "at_text": datetime.now().strftime("%H:%M:%S"),
-                "price": float(sold_price),
-                "qty": float(qty),
-                "stype": sig.stype,
-            }
+            # 止损后冷静期锁：冷静期内禁止新正T；冷静期满后仍需低于止损价 reentry_gap_pct 才允许接回。
+            # 仅跨日批次（买入日早于今天）写锁：当日买入、当日被时间止损平掉的批次，本质是
+            # 「用底仓额度提前平掉当日新仓」，止损价与该日回买机会无关；若照旧写锁，
+            # reentry_gap_pct（默认 0.5%）会把接回线压到止损价下方，导致当日全部回买被拦、
+            # 反T卖出悬空并跨日结转底仓缺口。买入日一律以批次 opened_at 判定。
+            _today = date.today().isoformat()
+            _closed_cross_day = [
+                b for b in used
+                if datetime.fromtimestamp(float(b.opened_at or 0)).date().isoformat() != _today
+            ]
+            if _closed_cross_day:
+                self._stop_lock[short] = {
+                    "at": time.time(),
+                    "at_text": datetime.now().strftime("%H:%M:%S"),
+                    "price": float(sold_price),
+                    "qty": float(qty),
+                    "stype": sig.stype,
+                }
+            # 当日新仓止损不写锁，也不清除既有锁：当日早前的跨日止损锁仍需按原语义继续约束回买
         self.save_state()
         return (f"核销买入批次 {sig.code} {int(qty)}股@"
                 f"{fmt_price(avg, sig.decimals)}，剩余待平 "
@@ -2185,16 +2501,25 @@ class SignalEngine:
             benchmark = float(rb.get("price", 0.0) or 0.0)
             benchmark_desc = "反T闭环基准（此前卖出价）"
         elif stype == "TIME_STOP":
-            # 平仓数量 = min(当日待平批次, 可卖余额)，并向下取整到 100 股：
-            # T+1 标的当日买入的份额当日不可卖，只按 pending_qty 下单会直接变成废单
+            # 平仓数量 = min(待平批次量, 可卖余额)，并向下取整到 100 股，不足 100 股不下单。
+            # 批次量取 pending（全部待平批次，含当日买入、次日才可卖的批次），与 _time_stop_checks
+            # 的判定来源、以及 register_fill 里 TIME_STOP 走 consume(code, qty) 不传 day 的
+            # FIFO 核销口径三者严格一致，保证卖出量与核销批次一一对应。
+            # 可卖余额口径还要扣掉跨日未回买结转的底仓缺口与今日已卖数量，
+            # 否则会把不存在的底仓再卖一遍（超卖）。
+            _day = date.today().isoformat()
+            _bs_sell = self.book.pending(q.code)
+            pend_sellable = float(sum(float(b.qty) for b in _bs_sell))
             left_sellable = max(0.0, pos["sellable_qty"]
+                                - float(self._base_gap.get(short, 0.0) or 0.0)
                                 - float(self._sold_today.get(short, 0.0) or 0.0))
-            raw_qty = min(pending_qty, left_sellable)
+            raw_qty = min(pend_sellable, left_sellable)
             qty = float(int(raw_qty // 100) * 100) if raw_qty >= 100 else 0.0
             # 强制平仓要让价：卖出下压至少 1 跳，确保对手盘能吃到
             price = round_price(max(tick, base - max(1, offset + 1) * tick), decimals)
-            benchmark = self.book.weighted_cost(q.code)
-            benchmark_desc = "待平批次加权成本（时间止损平仓）"
+            benchmark = ((sum(float(b.cost_price or 0) * float(b.qty) for b in _bs_sell) / pend_sellable)
+                         if pend_sellable > 0 else self.book.weighted_cost(q.code))
+            benchmark_desc = "可卖待平批次加权成本（时间止损平仓）"
         else:
             benchmark, benchmark_desc = self._sell_benchmark(q, conf, pos)
             left = max(0.0, pos["sellable_qty"]
@@ -4830,6 +5155,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="配置文件路径")
     parser.add_argument("--once", action="store_true", help="抓取一次行情并做信号诊断后退出")
     parser.add_argument("--selftest", action="store_true", help="注入测试信号，验证弹窗/日志链路")
+    parser.add_argument("--reset-base-gap", default="", metavar="CODE",
+                        help="清零跨日未回买结转的底仓缺口（传标的代码如 159325，传 all 清零全部），"
+                             "只改状态文件，不触发任何下单")
     parser.add_argument("--auto-confirm", action="store_true", help="自检时 3 秒后自动点击确认")
     parser.add_argument("--timeout", type=int, default=10, help="自检弹窗倒计时秒数（默认 10）")
     parser.add_argument("--detect", action="store_true",
@@ -4856,6 +5184,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     config_path = Path(args.config)
     cfg = load_config(config_path)
+    if args.reset_base_gap:
+        # 人工确认底仓已补回后清零缺口：只改状态文件，不触发任何下单
+        _eng = SignalEngine(cfg)
+        _eng.load_state()
+        if str(args.reset_base_gap).strip().lower() == "all":
+            _targets = sorted(_eng._base_gap.keys())
+        else:
+            _targets = [short_code(str(args.reset_base_gap).strip())]
+        for _c in _targets:
+            _eng._base_gap.pop(_c, None)
+        _eng.save_state()
+        print(f"已清零底仓缺口：{', '.join(_targets) if _targets else '无缺口'}")
+        return 0
     logger = setup_runtime_logger(cfg)
     # 进程启动即声明 DPI 感知：若等到点击前才设置，之前创建的 Tk 窗口会重置
     # 进程 DPI 上下文，导致坐标换算与实际像素不一致（拾取/定位两端必须同口径）。
